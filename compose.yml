@@ -1,0 +1,31 @@
+services:
+  config:
+    build:
+      context: .
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-${http_proxy:-}}
+        HTTPS_PROXY: ${HTTPS_PROXY:-${https_proxy:-}}
+    user: "${LOCAL_UID:?Run local render first}:${LOCAL_GID:?Run local render first}"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      HTTP_PROXY: ${HTTP_PROXY:-${http_proxy:-}}
+      HTTPS_PROXY: ${HTTPS_PROXY:-${https_proxy:-}}
+      NO_PROXY: ${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}
+    volumes:
+      - ./runtime:/config:ro
+      - ./state:/state
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:mode=1777,size=128m
+    pids_limit: 128
+    mem_limit: 512m
+    healthcheck:
+      test: [CMD, python3, /app/service.py, health]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
