@@ -25,8 +25,13 @@ The old marko-network worktree and its uncommitted edits are untouched.
 
 1. Load rendered private settings (flat JSON; exactly the shape mounted by Compose).
 2. Fetch HTTPS subscription, convert locally, classify all matching HK/SG candidates.
-3. Check candidate syntax with pinned core; probe all candidates; rank each region.
-4. HK empty-after-probe permits testing own hy2; missing HK input does not.
+3. Check candidate syntax with pinned core; require Google 204 with an empty body for every candidate.
+   Download and hash-check a bounded CacheFly range only for each region's Google-leading shortlist,
+   extending it if fewer than k pass. Rank verified nodes by 60% Google time + 40% CacheFly transfer time.
+4. Append own hy2 to the HK selector for manual choice on every successful publication, after subscription top-k.
+   Probe it only when HK subscription nodes are empty after probing (including no HK entries); then it becomes default only if healthy.
+   Singapore has no backup, so an empty or fully failing SG group refuses publication.
+   Private manual_nodes are merged with subscription nodes before classification and probing.
 5. Build one client profile; real sing-box check; atomically persist snapshot before making it available.
 6. GET serves only a checked snapshot. Refresh failures keep the previous snapshot, expose only static errors, and retry.
 

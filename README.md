@@ -25,32 +25,50 @@ IP 白名单要等解析后才知道是否命中，因此未匹配域名白名�
 ## 选路与故障边界
 
 - 容器从一个 HTTPS 订阅拉取节点，用已有 `sing-box-subscribe-cli v1.0.4` 转换；不向第三方转换 API 提交订阅。
-- 通过节点真实访问 `https://www.google.com/`，测完整 HTTPS 请求耗时，非 ICMP。环境代理只用于拉订阅，不能替代被测节点。
-- 按备注正则区分 HK/SG。默认 k=3，每轮测全部匹配候选，每组保留成功者中最快的 k 个（不足 k 就保留全部成功者）。
+- 第一阶段经每个节点请求 `https://www.google.com/generate_204`，**必须返回 204 且正文为空**；不能只凭 curl 退出码把登录页/错误页当成功。环境代理不能替代被测节点。
+- 第二阶段仅对每组 Google 耗时最短的 `max(2k, k+2)` 个候选下载 CacheFly `1mb.test` 前 128 KiB，要求 HTTPS、206、精确长度及固定 SHA-256；不足 k 个通过时继续测后续候选。两个目标均通过才算可用。
+- 排名分数为 `0.6 × Google 请求耗时 + 0.4 × CacheFly 小块下载耗时`（毫秒，越低越好）。默认每组保留前 k 个；这是服务器视角的短名单排序，不是客户端网速保证。小块下载包含连接延迟，不能当作纯带宽测量。
 - 默认每轮结束后 300 秒再刷新；k、间隔、并发、超时、上限可调。超过上限报错，不截断候选。
 - SFA 中 HK/SG 各一个 selector，默认是本轮最快节点，其余 top-k 供手动选择。**不在手机上运行 urltest。**
-- 只有本轮全部订阅 HK 节点探测失败，才探测并下发自有 HK hy2。正常配置不包含自有 hy2；订阅 HK 恢复后下一份配置恢复订阅节点。
-- 缺少地区、订阅获取/转换失败、SG 全失败、HK 与自有 hy2 都失败、核心检查失败：不发布新配置，保留旧快照。
+- 自有 HK hy2 **始终列在 HK selector 末尾供手动选择**，不参与订阅节点 top-k 排名；订阅 HK 可用时，默认仍是服务器测得最快的订阅节点。
+  只有本轮没有可用的订阅 HK 节点（包括订阅里没有香港节点）时，才探测自有 hy2；探测成功后把它作为默认节点，否则不发布新配置。
+  订阅 HK 恢复后，下一份配置重新默认订阅节点，但仍保留自有 hy2 手动选项。
+- 服务器测速只验证**容器当时到两个测试 URL**的路径，不能保证 Pad 所在网络或 Google/YouTube App 可用；`connection ... finished` 也不等于业务成功。
+- 新加坡没有备份：SG 无候选或全失败都会拒绝发布。
+- 订阅获取/转换失败、HK 与自有 hy2 都失败、手动节点被转换器丢弃、核心检查失败：不发布新配置，保留旧快照。
+- `manual_nodes` 可放你自己的 vmess/vless/trojan/hysteria2/hysteria/tuic/anytls/ss/socks/http 链接，
+  与订阅节点合并后一起参与分类与测速。手动节点只放进私有配置，不进 Git、不进镜像。
 - **切换需要 SFA 重新拉取并应用配置。** 纯配置 URL 服务不能修改已经运行的客户端配置。手机网络上的节点状态可能不同于容器的探测结果。
 - `10.77.0.0/24` 不通时由用户手动切换 v2rayNG，本服务不自动处理。
 
-## 私有配置：先初始化，再编辑，后 render
+## 本地操作入口 `cli.py`（界面与输出全英文）
 
-本地入口是 `cli.py`。默认是 Rich + questionary 菜单，仅有“初始化模板 / 渲染 / 退出”，没有部署菜单。
-菜单可选依赖在 `requirements-menu.txt`，只装进 venv；`init`、`render` 直接动作仅使用 Python 标准库。
+菜单（Rich + questionary）：Initialize private settings template / Render private runtime settings /
+Build service image / Start service / Stop service / Show service logs / Follow service logs /
+Show service status / Exit。
+菜单依赖在 `requirements-menu.txt`（需 pin `prompt_toolkit==3.0.47`），只装进 venv；
+同一批动作也可直接调用：`init`、`render`、`build`、`up`、`down`、`logs`、`status`，仅用标准库。
 
-1. 打开该入口，选择“初始化 private-config 模板”。已有文件绝不覆盖。
-2. 用 Neovim 或其他编辑器填写 `private-config/settings.json` 的占位符。
-3. 填入订阅 URL、32–128 位 URL-safe 随机 API key、WG 客户端地址（/32）及密钥、WG endpoint、自有 hy2。
-4. 填写 `singapore` 白名单。可在 `direct` 加个人强制直连条目，它与内置列表合并。
-5. 选择“渲染私有运行配置”。校验通过后产生 `runtime/settings.json` 和 Compose 所需 `.env`，创建 `state/`。
+1. 选择 Initialize，生成 `private-config/settings.json`。已有文件绝不覆盖。
+2. 用 Neovim 或其他编辑器填写占位符：订阅 URL、API key、WG 客户端地址（/32）及密钥、WG endpoint、自有 hy2。
+3. `api_key` 必须为 **32–128 个 URL-safe 字符**：`A-Z a-z 0-9 _ -`。因为该 key 会出现在订阅 URL 的查询串里，
+   `+ / = !` 等字符被拒绝（基密码管理器生成、带 `=+/` 的 base64 串会直接报 `api_key_format`）。
+4. 填写 `singapore` 白名单。`direct` 可加个人强制直连条目，与内置列表合并。
+   `manual_nodes` 是字符串数组，每项一条 URI（例如 `"hysteria2://.../#🇭🇰HK manual"`）；取名带香港/新加坡字样即可被分区正则识别。
+   转换器若丢弃任一手动条目，本轮直接失败，不会静默少节点。
+5. 选择 Render。校验通过后才产生 `runtime/settings.json` 和 Compose 所需 `.env`，并创建 `state/`。
 
-**render 不拉订阅、不测速、不生成假节点、不启动容器。** 完整 SFA JSON 由容器获取订阅并完成验证后产生。
-未填写占位符会拒绝 render，这是有意的；不需要把真实私钥交给代理。
+**render 不拉订阅、不测速、不生成假节点、不启动容器。** 完整 SFA JSON 由容器获取订阅并验证后产生。
+界面不会显示裸错误码：`failed: <code> - <fixed guidance>`，且不回显任何用户填写的值。
+未填占位符会拒绝 render，这是有意的；不需要把真实私钥交给代理。
 
 ## Docker 部署边界
 
-用 Docker Compose 打开仓库根目录的 `compose.yml`，构建并启动唯一的 `config` 服务。
+菜单里的 Build / Start / Stop / Logs / Status，或 `cli.py build|up|down|logs|status`，就是对
+仓库根目录 `compose.yml` 里唯一 `config` 服务的 `docker compose build|up -d|down|logs --tail=100|ps`。
+先探测 `docker info`：能用普通用户就不加 sudo；否则用 `sudo -v` 在终端里显式要密码，
+并只把 `HTTP_PROXY/HTTPS_PROXY/NO_PROXY`（大小写都识别）经 `sudo --preserve-env` 传给 Compose。
+未先 render 会以 `render_required` 拒绝，不会去动宿主服务。
 首次交付只支持 **linux/amd64**，其他架构显式构建失败。固定核心与转换器版本并校验下载 SHA-256；基础 Python 镜像按版本系列，不宣称整个镜像字节级可复现。
 
 | 宿主路径 | 容器路径 | 权限/用途 |
@@ -77,11 +95,48 @@ IP 白名单要等解析后才知道是否命中，因此未匹配域名白名�
 - 成功 200：完整 sing-box JSON；密钥错误 401；尚无有效配置 503；POST 405。
 - `/healthz` 仅返回 ready/stale、刷新阶段、静态错误码、数量、是否启用 hy2，不输出节点、密钥或订阅地址。
 - 健康检查检查 `ready`，不是仅看 HTTP 200。已有旧配置时 ready=true、刷新失败 stale=true。
+- 诊断只走 stdout：菜单的 Follow service logs（`cli.py logs-follow`）持续显示每轮结果，
+  失败时是 `refresh failed stage=<阶段> error=<静态码> | <异常类型>: <详情>`。
+  **服务不往宿主写任何诊断文件**，`state/` 里只有 `snapshot.json`。
+  API 仍只返回静态码；日志中的订阅 URL、API key、hy2 与手动节点凭据会被替换成 `<redacted>`。
+
+默认 INFO 仅记录发布结果与失败摘要。需要查具体节点为何被筛掉时，在执行菜单的 Start service
+（或 `cli.py up`）时设置 `SINGBOX_LOG_LEVEL=DEBUG`；Compose 将其传入容器，服务启动时生效。
+DEBUG 逐个记录候选所属地区、标准化 tag、节点地址/端口/协议、Google 与 CacheFly 的探测
+结果（HTTP 状态、字节数、耗时或 curl 退出码）、综合分数，以及最终 `selected`、
+`google_failed`、`cachefly_failed`、`not_shortlisted`、`top_k_excluded` 等取舍原因。
+日志中的节点名采用 `hk-007@abcdef123456` 形式：后缀是转换后节点配置（不含易变的 tag）
+规范化 SHA-256 的前 12 位，订阅顺序或备注改变仍能关联同一节点。原始订阅 URI 在转换后
+不逐条保留；哈希只用于诊断，不改变下发给客户端的节点 tag、排序或路由。
+它不输出节点认证信息或原始订阅链接。`logs-follow` 只负责查看日志，按 Ctrl+C 不会停止服务。
+仅改变日志等级无需重新 render 或 build，但要再次 Start service 让 Compose 按新环境重建容器；
+未设置时恢复 INFO。无效等级会被本地 CLI 拒绝。
 
 没有上传配置接口、远程修改接口、模式枚举或管理 WebUI。服务日志不记录请求 URL。
 更换 API key 后旧 key 立即不再有效；策略改动在下一次成功刷新后发布。
 
 ## 回退与验收
+
+## 故障排查：先看 healthz 的 stage
+
+| stage | 含义 | 先查什么 |
+|---|---|---|
+| settings | 私有配置不可读或不合规 | 文件属主/权限 0600、字段是否齐全 |
+| fetch | 订阅拉取失败 | 多半是容器没走代理，见下 |
+| convert | 本地转换器失败 | 订阅格式、是否含不支持协议 |
+| select | 分区或测速阶段 | 缺新加坡、候选超限、地区正则重叠 |
+| check | 拼好的配置被核心判非法 | `docker compose logs` 里的 `tool failed: ... FATAL ...` |
+| fetch | 订阅拉取失败 | 同上的 `stage=fetch` 行，先确认容器有代理 |
+| convert | 本地转换器失败 | 同上的 `stage=convert` 行 |
+| select | 分区或测速阶段 | 同上，常见 `singapore_unavailable`、`candidate_limit` |
+| publish | 落盘失败 | state 目录权限 |
+
+\`wireguard.address\` 可以写裸 IP（会自动规范成 \`/32\`）；带掩码时必须正好是 \`/32\`，否则拒绝。
+
+容器只持有**启动它的那个 shell** 里的代理变量。宿主有代理并不等于容器有：先
+\`export HTTPS_PROXY=http://<proxy>:<port>\` 再 \`cli.py up\`，或写成
+\`HTTPS_PROXY=http://<proxy>:<port> python3 cli.py up\`。\`cli.py diagnose\` 会打印容器内代理环境
+（只显示 set/unset，不显示值）并当场实拉一次订阅，能直接区分"网络不通"和"配置不对"。
 
 在 SFA 中保留原有可用配置，新增这条远程配置，避免覆盖唯一救援入口；WG 失败按约定手动切换 v2rayNG。
 仓库尚未在你的服务器部署；`docs/acceptance.md` 列出本地证据与必须由真实环境完成的验收。

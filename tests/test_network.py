@@ -1,5 +1,6 @@
 """Loopback-only runtime checks: genuine sing-box outbound and routing, no real nodes."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import os
 from pathlib import Path
 import socket
@@ -49,13 +50,32 @@ class LocalNetworkTests(unittest.TestCase):
     def test_actual_probe_uses_outbound_despite_no_proxy(self):
         proxy = self.server('proxied')
         with patch.dict(os.environ, {'NO_PROXY': '*', 'no_proxy': '*', 'HTTPS_PROXY': 'http://127.0.0.1:1'}):
-            elapsed = m.probe(self.node(proxy, 'node'), settings(), url='http://unresolvable.example.invalid/test')
+            elapsed = m.probe(self.node(proxy, 'node'), settings(),
+                              url='http://unresolvable.example.invalid/test', expected_status=200)
         self.assertIsNotNone(elapsed)
         self.assertGreater(elapsed, 0)
         self.assertEqual(len(proxy.hits), 1)
         self.assertIn(b'unresolvable.example.invalid', proxy.hits[0])
         bad = self.node(proxy, 'bad'); bad['server_port'] = 1
-        self.assertIsNone(m.probe(bad, settings(), url='http://unresolvable.example.invalid/test'))
+        self.assertIsNone(m.probe(self.node(proxy, 'node'), settings(),
+                                  url='http://unresolvable.example.invalid/test'))
+        self.assertIsNone(m.probe(bad, settings(), url='http://unresolvable.example.invalid/test',
+                                  expected_status=200))
+
+    def test_probe_rejects_wrong_body_length_and_digest(self):
+        proxy = self.server('proxied')
+        node = self.node(proxy, 'node')
+        url = 'http://unresolvable.example.invalid/test'
+        digest = hashlib.sha256(b'proxied').hexdigest()
+        with self.assertLogs(m.LOG, level='DEBUG') as captured:
+            self.assertIsNotNone(m._http_probe(node, settings(), m.CORE, url, 200, 7, digest))
+            self.assertIsNone(m._http_probe(node, settings(), m.CORE, url, 200, 8, digest))
+            self.assertIsNone(m._http_probe(node, settings(), m.CORE, url, 200, 7, '0' * 64))
+        logs = '\n'.join(captured.output)
+        self.assertIn('tag=node@' + m.node_fingerprint(node), logs)
+        self.assertIn('result=ok http=200 bytes=7', logs)
+        self.assertIn('result=body_size http=200 bytes=7', logs)
+        self.assertIn('result=body_sha256 http=200 bytes=7', logs)
 
     def test_actual_route_direct_precedes_sg_then_hk(self):
         direct, sg, hk = self.server('DIRECT'), self.server('SG'), self.server('HK')

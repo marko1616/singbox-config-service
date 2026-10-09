@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import ipaddress
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -21,9 +22,23 @@ import urllib.request
 
 CORE = os.environ.get("SING_BOX", "/usr/local/bin/sing-box")
 CONVERTER = os.environ.get("SING_BOX_SUB", "/usr/local/bin/sing-box-sub")
-PROBE_URL = "https://www.google.com/"
+PROBE_URL = "https://www.google.com/generate_204"
+CACHEFLY_URL = "https://cachefly.cachefly.net/1mb.test"
+CACHEFLY_BYTES = 131072
+CACHEFLY_SHA256 = "fa43239bcee7b97ca62f007cc68487560a39e19f74f3dde7486db3f98df8e471"
 OVERLAY = "10.77.0.0/24"
 LIMIT = 8 * 1024 * 1024
+# Everything goes to stdout/docker logs; nothing diagnostic is written to the host.
+LOG = logging.getLogger('singbox-config-service')
+LOG_LEVELS = {'DEBUG': logging.DEBUG, 'INFO': logging.INFO,
+              'WARNING': logging.WARNING, 'ERROR': logging.ERROR}
+# Registered when settings load, so no log line can echo them.
+SECRETS = set()
+SETTINGS_PATH = os.environ.get('SINGBOX_SETTINGS', '/config/settings.json')
+SNAPSHOT_PATH = os.environ.get('SINGBOX_SNAPSHOT', '/state/snapshot.json')
+# URI schemes accepted in settings.manual_nodes (private, never tracked).
+MANUAL_SCHEMES = ("vmess://", "vless://", "trojan://", "hysteria2://", "hysteria://",
+                  "tuic://", "anytls://", "ss://", "socks://", "http://")
 
 
 class Invalid(ValueError):
@@ -73,7 +88,7 @@ def validate(s):
     require(isinstance(s, dict), "settings_object")
     fields = {"api_key", "subscription_url", "subscription_user_agent", "top_k", "refresh_seconds",
               "probe_timeout_seconds", "probe_workers", "max_candidates", "hk_pattern", "sg_pattern",
-              "direct", "singapore", "wireguard", "own_hy2"}
+              "direct", "singapore", "wireguard", "own_hy2", "manual_nodes"}
     require(set(s) == fields, "settings_fields")
     require(not any(isinstance(v, str) and v.startswith('<') for v in walk(s)), "unfilled_template")
     require(isinstance(s['api_key'], str) and re.fullmatch(r'[A-Za-z0-9_-]{32,128}', s['api_key']), "api_key_format")
@@ -86,6 +101,12 @@ def validate(s):
     for key in ('hk_pattern', 'sg_pattern'):
         require(isinstance(s[key], str) and 0 < len(s[key]) < 256, "region_pattern")
         re.compile(s[key])
+    require(isinstance(s['manual_nodes'], list) and len(s['manual_nodes']) <= 200, 'manual_nodes_list')
+    for entry in s['manual_nodes']:
+        require(isinstance(entry, str) and 0 < len(entry) <= 4096, 'manual_node_entry')
+        require(not any(c in entry for c in '\r\n\t'), 'manual_node_entry')
+        require('://' in entry and entry.split('://', 1)[0].lower() + '://' in MANUAL_SCHEMES,
+                'manual_node_scheme')
     for key in ('direct', 'singapore'):
         rules = s[key]
         require(isinstance(rules, dict) and set(rules) == {'ip_cidr', 'domain', 'domain_suffix'}, 'rule_fields')
@@ -100,6 +121,9 @@ def validate(s):
     require(set(w) == {'address', 'private_key', 'peer_public_key', 'endpoint', 'port', 'mtu'}, 'wireguard_fields')
     address = ipaddress.ip_interface(w['address'])
     require(address.version == 4 and address.ip in ipaddress.ip_network(OVERLAY) and address.network.prefixlen == 32, 'wireguard_address_must_be_host_32')
+    # ip_interface() defaults a bare IP to /32, but sing-box's netip.ParsePrefix
+    # needs an explicit mask, so normalise here and in the emitted profile.
+    w['address'] = str(address)
     for key in ('private_key', 'peer_public_key'):
         require(len(base64.b64decode(w[key], validate=True)) == 32, 'wireguard_key')
     try:
@@ -121,6 +145,7 @@ def validate(s):
     require(isinstance(h['password'], str) and h['password'], 'hy2_password')
     require(set(h['tls']) == {'enabled', 'server_name'} and h['tls']['enabled'] is True, 'hy2_tls')
     domain(h['tls']['server_name'])
+    register_secrets(s)
     return s
 
 
@@ -144,8 +169,88 @@ def load_settings(path):
 
 def checked(args, timeout=30):
     result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
-    require(result.returncode == 0, 'tool_failed')
+    if result.returncode != 0:
+        detail = scrub((result.stderr or b'').decode('utf-8', 'replace'))[:4000]
+        LOG.error('tool failed: %s | %s', ' '.join(map(str, args)), detail)
+        raise Invalid('tool_failed')
     return result
+
+
+def register_secrets(settings):
+    """Remember values that must never appear in a log line."""
+    if not isinstance(settings, dict):
+        return
+    values = [settings.get('subscription_url'), settings.get('api_key')]
+    hy2 = settings.get('own_hy2')
+    if isinstance(hy2, dict):
+        values.append(hy2.get('password'))
+    for entry in settings.get('manual_nodes') or []:
+        if isinstance(entry, str) and '://' in entry:
+            rest = entry.split('://', 1)[1]
+            if '@' in rest:
+                values.append(rest.split('@', 1)[0])
+    for value in values:
+        if isinstance(value, str) and len(value) >= 8:
+            SECRETS.add(value)
+
+
+def scrub(text, settings=None):
+    """Redact the subscription URL, keys and credentials before logging."""
+    text = str(text)
+    values = set(SECRETS)
+    if isinstance(settings, dict):
+        values.update(v for v in (settings.get('subscription_url'), settings.get('api_key')) if v)
+    for value in values:
+        text = text.replace(str(value), '<redacted>')
+    return text
+
+
+def node_endpoint(node):
+    """One escaped, credential-free endpoint for local diagnostics."""
+    return json.dumps(scrub(str(node.get('server', ''))), ensure_ascii=True)
+
+
+def node_fingerprint(node):
+    """Stable short ID for a converted outbound; omit its mutable display tag."""
+    payload = {key: value for key, value in node.items() if key != 'tag'}
+    canonical = json.dumps(payload, sort_keys=True, separators=(',', ':'),
+                           ensure_ascii=False).encode('utf-8')
+    return hashlib.sha256(canonical).hexdigest()[:12]
+
+
+def node_log_tag(node):
+    """Keep the client-facing tag unchanged; annotate only its log representation."""
+    return f"{node['tag']}@{node_fingerprint(node)}"
+
+
+def trace_probe(node, target, result, status='-', size='-', elapsed='-', curl_exit='-'):
+    LOG.debug('probe target=%s tag=%s result=%s http=%s bytes=%s ms=%s curl_exit=%s',
+              target, node_log_tag(node), result, status, size, elapsed, curl_exit)
+
+
+def diagnose_report(settings_path=None, fetcher=None):
+    """Safe to print: no secrets, proxy values reported as set/unset only."""
+    lines = []
+    proxy_keys = ('HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy')
+    lines.append('--- container proxy environment (values hidden) ---')
+    lines.append(json.dumps({k: ('set' if os.environ.get(k) else 'unset') for k in proxy_keys}))
+    lines.append('--- live subscription fetch (uses this container network) ---')
+    try:
+        s = load_settings(settings_path or SETTINGS_PATH)
+    except Exception as exc:
+        lines.append('settings unusable: ' + type(exc).__name__ + ': ' +
+                     (str(exc) if isinstance(exc, Invalid) else 'load_failed'))
+    else:
+        start = time.monotonic()
+        try:
+            data = (fetcher or fetch)(s)
+        except Exception as exc:
+            lines.append('fetch failed: ' + type(exc).__name__ + ': ' + scrub(str(exc), s))
+        else:
+            lines.append(f'fetch ok: bytes={len(data)} seconds={time.monotonic() - start:.1f}')
+    lines.append('--- recent failures live in the container log ---')
+    lines.append('docker compose logs --tail=100 config')
+    return '\n'.join(lines) + '\n'
 
 
 def check_profile(profile, core=CORE):
@@ -187,8 +292,20 @@ def convert(data, converter=CONVERTER):
     return result
 
 
-def probe(node, s, core=CORE, url=PROBE_URL):
-    """Actual HTTPS through this outbound; measured on container network, not ICMP."""
+def probe(node, s, core=CORE, url=PROBE_URL, expected_status=204):
+    """Check the exact HTTP response through this outbound, on the container network."""
+    return _http_probe(node, s, core, url, expected_status, 0 if expected_status == 204 else None)
+
+
+def probe_cachefly(node, s, core=CORE):
+    """Download and verify a bounded CacheFly range through the candidate node."""
+    return _http_probe(node, s, core, CACHEFLY_URL, 206, CACHEFLY_BYTES,
+                       CACHEFLY_SHA256, f'0-{CACHEFLY_BYTES - 1}')
+
+
+def _http_probe(node, s, core, url, expected_status, expected_bytes=None,
+                expected_sha256=None, byte_range=None):
+    target = 'google' if expected_status == 204 else 'cachefly' if expected_status == 206 else 'custom'
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
@@ -205,21 +322,48 @@ def probe(node, s, core=CORE, url=PROBE_URL):
             deadline = time.monotonic() + 5
             while True:
                 if proc.poll() is not None or time.monotonic() >= deadline:
+                    trace_probe(node, target, 'core_start_failed')
                     return None
                 try:
                     with socket.create_connection(('127.0.0.1', port), timeout=.1):
                         break
                 except OSError:
                     time.sleep(.05)
-            # curl --proxy + --noproxy '' prevents NO_PROXY from bypassing the tested outbound.
-            start = time.monotonic()
-            r = subprocess.run(['curl', '--silent', '--fail', '--output', os.devnull,
-                                '--proxy', f'http://127.0.0.1:{port}', '--noproxy', '',
-                                '--max-time', str(s['probe_timeout_seconds']), url],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            # Explicit proxy and noproxy prevent environment proxy/bypass leakage.
+            output = Path(tmp) / 'response'
+            args = ['curl', '--silent', '--fail', '--output', str(output),
+                    '--write-out', '%{http_code} %{size_download} %{time_total}',
+                    '--proxy', f'http://127.0.0.1:{port}', '--noproxy', '',
+                    '--max-time', str(s['probe_timeout_seconds']),
+                    '--max-filesize', str(expected_bytes if expected_bytes else 1024)]
+            if byte_range is not None:
+                args += ['--range', byte_range]
+            r = subprocess.run(args + [url], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                timeout=s['probe_timeout_seconds'] + 2)
-            return round((time.monotonic() - start) * 1000, 3) if r.returncode == 0 else None
-        except (OSError, subprocess.TimeoutExpired):
+            fields = r.stdout.decode('ascii').split()
+            status = fields[0] if len(fields) == 3 else '-'
+            size = fields[1] if len(fields) == 3 else '-'
+            if r.returncode != 0:
+                trace_probe(node, target, 'curl_failed', status, size, curl_exit=r.returncode)
+                return None
+            status, size, seconds = fields
+            if int(status) != expected_status:
+                trace_probe(node, target, 'http_status', status, size)
+                return None
+            if expected_bytes is not None and (int(size) != expected_bytes or output.stat().st_size != expected_bytes):
+                trace_probe(node, target, 'body_size', status, size)
+                return None
+            if expected_sha256 is not None and hashlib.sha256(output.read_bytes()).hexdigest() != expected_sha256:
+                trace_probe(node, target, 'body_sha256', status, size)
+                return None
+            elapsed = round(float(seconds) * 1000, 3)
+            trace_probe(node, target, 'ok', status, size, elapsed)
+            return elapsed
+        except subprocess.TimeoutExpired:
+            trace_probe(node, target, 'process_timeout')
+            return None
+        except (OSError, ValueError, UnicodeError):
+            trace_probe(node, target, 'invalid_response_or_io')
             return None
         finally:
             proc.terminate()
@@ -230,18 +374,33 @@ def probe(node, s, core=CORE, url=PROBE_URL):
                 proc.wait()
 
 
-def select(nodes, s, measure=probe, checker=check_profile):
+def select(nodes, s, measure=probe, checker=check_profile, measure_download=None):
+    # A custom measure is a complete synthetic probe in tests; production uses
+    # the separate CacheFly transfer after the Google response check.
+    if measure_download is None:
+        measure_download = probe_cachefly if measure is probe else measure
     groups = {'hk': [], 'sg': []}
     patterns = {g: re.compile(s[g + '_pattern']) for g in groups}
     for node in nodes:
         match = [g for g in groups if patterns[g].search(node['tag'])]
+        if len(match) > 1:
+            LOG.debug('candidate result=excluded reason=ambiguous_region node_id=%s endpoint=%s port=%s protocol=%s',
+                      node_fingerprint(node), node_endpoint(node), node.get('server_port'), node.get('type'))
         require(len(match) <= 1, 'ambiguous_region')
         if match:
             n = copy.deepcopy(node)
             g = match[0]
             n['tag'] = f'{g}-{len(groups[g]) + 1:03d}'
             groups[g].append(n)
-    require(all(groups.values()), 'missing_region')
+            LOG.debug('candidate result=included region=%s tag=%s endpoint=%s port=%s protocol=%s',
+                      g, node_log_tag(n), node_endpoint(n), n.get('server_port'), n.get('type'))
+        else:
+            LOG.debug('candidate result=excluded reason=no_region_match node_id=%s endpoint=%s port=%s protocol=%s',
+                      node_fingerprint(node), node_endpoint(node), node.get('server_port'), node.get('type'))
+    # No Singapore entries means no Singapore path at all, and there is no
+    # Singapore backup. No Hong Kong entries is the same situation as all of
+    # them failing, so the owner's own hy2 may take over below.
+    require(groups['sg'], 'singapore_unavailable')
     candidates = groups['hk'] + groups['sg']
     require(len(candidates) <= s['max_candidates'], 'candidate_limit')
     # Do not misclassify unsupported syntax as an unreachable node and enter fallback.
@@ -249,21 +408,77 @@ def select(nodes, s, measure=probe, checker=check_profile):
              'outbounds': candidates, 'route': {'default_domain_resolver': 'bootstrap'}})
     with ThreadPoolExecutor(max_workers=s['probe_workers']) as pool:
         times = list(pool.map(lambda n: measure(n, s), candidates))
-    scores = dict(zip([n['tag'] for n in candidates], times))
+    google_times = dict(zip([n['tag'] for n in candidates], times))
+    for node in candidates:
+        ms = google_times[node['tag']]
+        LOG.debug('google tag=%s result=%s ms=%s', node_log_tag(node),
+                  'ok' if ms is not None else 'failed', ms)
     chosen = {}
     counts = {}
     for g, values in groups.items():
-        healthy = [n for n in values if scores[n['tag']] is not None]
-        healthy.sort(key=lambda n: (scores[n['tag']], n['tag']))
-        chosen[g] = healthy[:s['top_k']]
-        counts[g] = {'tested': len(values), 'healthy': len(healthy), 'retained': len(chosen[g])}
+        google_ok = [n for n in values if google_times[n['tag']] is not None]
+        google_ok.sort(key=lambda n: (google_times[n['tag']], n['tag']))
+        # Download only the leading 2k candidates. If too few pass, extend the
+        # shortlist until k are verified or the region is exhausted.
+        verified = []
+        download_results = {}
+        limit = min(len(google_ok), max(2 * s['top_k'], s['top_k'] + 2))
+        index = 0
+        while index < len(google_ok) and (index < limit or len(verified) < s['top_k']):
+            node = google_ok[index]
+            download_ms = measure_download(node, s)
+            download_results[node['tag']] = download_ms
+            if download_ms is not None:
+                score = .6 * google_times[node['tag']] + .4 * download_ms
+                verified.append((score, node['tag'], node))
+                LOG.debug('cachefly tag=%s result=ok ms=%s score_ms=%.3f',
+                          node_log_tag(node), download_ms, score)
+            else:
+                LOG.debug('cachefly tag=%s result=failed', node_log_tag(node))
+            index += 1
+        verified.sort(key=lambda item: (item[0], item[1]))
+        chosen[g] = [node for _, _, node in verified[:s['top_k']]]
+        selected = {node['tag'] for node in chosen[g]}
+        for node in values:
+            tag = node['tag']
+            reason = ('google_failed' if google_times[tag] is None else
+                      'not_shortlisted' if tag not in download_results else
+                      'cachefly_failed' if download_results[tag] is None else
+                      'selected' if tag in selected else 'top_k_excluded')
+            LOG.debug('decision region=%s tag=%s result=%s', g, node_log_tag(node), reason)
+        counts[g] = {'tested': len(values), 'healthy': len(verified), 'retained': len(chosen[g])}
     require(chosen['sg'], 'singapore_unavailable')
     fallback = not chosen['hk']
+    own = dict(copy.deepcopy(s['own_hy2']), type='hysteria2', tag='hk-own-hy2')
     if fallback:
-        own = dict(copy.deepcopy(s['own_hy2']), type='hysteria2', tag='hk-own-hy2')
-        require(measure(own, s) is not None, 'hong_kong_unavailable')
-        chosen['hk'] = [own]
+        LOG.debug('candidate result=included region=hk tag=%s endpoint=%s port=%s protocol=hysteria2',
+                  node_log_tag(own), node_endpoint(own), own.get('server_port'))
+        own_google = measure(own, s)
+        own_download = measure_download(own, s) if own_google is not None else None
+        LOG.debug('decision region=hk tag=%s result=%s google_ms=%s cachefly_ms=%s',
+                  node_log_tag(own), 'selected' if own_download is not None else 'fallback_failed',
+                  own_google, own_download)
+        require(own_download is not None, 'hong_kong_unavailable')
+    else:
+        LOG.debug('decision region=hk tag=%s result=manual_only_not_probed', node_log_tag(own))
+    # Keep the owner's node available for manual selection even when subscription
+    # HK nodes pass the server-side probe. It does not compete for top-k/default.
+    chosen['hk'].append(own)
+    counts['hk']['retained'] = len(chosen['hk'])
     return chosen, {'counts': counts, 'hk_fallback': fallback}
+
+
+def merge_nodes(nodes, extra):
+    """Append manual nodes, keeping tags unique so region matching stays unambiguous."""
+    seen = {n['tag'] for n in nodes}
+    merged = list(nodes)
+    for index, node in enumerate(extra, 1):
+        candidate = copy.deepcopy(node)
+        if candidate['tag'] in seen:
+            candidate['tag'] = f"{candidate['tag']} -m{index}"
+        seen.add(candidate['tag'])
+        merged.append(candidate)
+    return merged
 
 
 def rule_items(rules):
@@ -296,11 +511,12 @@ def build_profile(s, chosen):
             {'type': 'local', 'tag': 'bootstrap'},
             {'type': 'https', 'tag': 'dns-hk', 'server': '1.1.1.1', 'path': '/dns-query', 'detour': 'hk'},
             {'type': 'https', 'tag': 'dns-sg', 'server': '1.1.1.1', 'path': '/dns-query', 'detour': 'sg'}],
-            'rules': dns_rules, 'final': 'dns-hk', 'independent_cache': True},
+            'rules': dns_rules, 'final': 'dns-hk'},
         'inbounds': [{'type': 'tun', 'tag': 'tun-in', 'address': ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'],
                       'auto_route': True, 'strict_route': True, 'stack': 'mixed'}],
         'endpoints': [{'type': 'wireguard', 'tag': 'wg-ipv6', 'system': False,
-                       'address': [w['address']], 'private_key': w['private_key'], 'mtu': w['mtu'],
+                       'address': [str(ipaddress.ip_interface(w['address']))],
+                       'private_key': w['private_key'], 'mtu': w['mtu'],
                        'domain_resolver': {'server': 'bootstrap', 'strategy': 'ipv6_only'},
                        'peers': [{'address': w['endpoint'], 'port': w['port'],
                                   'public_key': w['peer_public_key'], 'allowed_ips': [OVERLAY],
@@ -337,12 +553,18 @@ class Publisher:
 
     def refresh(self):
         stage = 'settings'
+        s = None
         try:
             s = load_settings(self.settings)
             stage = 'fetch'
             data = self.fetcher(s)
             stage = 'convert'
             nodes = self.converter(data)
+            if s['manual_nodes']:
+                extra = self.converter(('\n'.join(s['manual_nodes']) + '\n').encode())
+                # A dropped manual entry must not silently reduce the candidate set.
+                require(len(extra) == len(s['manual_nodes']), 'manual_node_rejected')
+                nodes = merge_nodes(nodes, extra)
             stage = 'select'
             chosen, summary = select(nodes, s, self.measure, self.checker)
             stage = 'check'
@@ -356,11 +578,18 @@ class Publisher:
             with self.lock:
                 self.data, self.updated, self.summary = encode(p), updated, summary
                 self.error, self.stage = None, 'ready'
+            counts = summary['counts']
+            LOG.info('published hk_retained=%s hk_tested=%s sg_retained=%s sg_tested=%s fallback=%s',
+                     counts['hk']['retained'], counts['hk']['tested'],
+                     counts['sg']['retained'], counts['sg']['tested'], summary['hk_fallback'])
             return True
         except Exception as exc:
+            code = str(exc) if isinstance(exc, Invalid) else 'operation_failed'
+            detail = '' if isinstance(exc, Invalid) else ' | ' + type(exc).__name__ + ': ' + scrub(str(exc), s)
+            LOG.error('refresh failed stage=%s error=%s%s', stage, code, detail)
             with self.lock:
-                # Exception contents and subscription/core output are deliberately not exposed.
-                self.error = str(exc) if isinstance(exc, Invalid) else 'operation_failed'
+                # Only the static code is exposed through the API.
+                self.error = code
                 self.stage = stage
             return False
 
@@ -429,6 +658,11 @@ def handler_for(publisher):
 
 def main():
     os.umask(0o077)
+    # Diagnostics go to stdout so `docker compose logs` shows them.
+    level = os.environ.get('SINGBOX_LOG_LEVEL', 'INFO').upper()
+    require(level in LOG_LEVELS, 'log_level')
+    logging.basicConfig(stream=sys.stdout, level=LOG_LEVELS[level],
+                        format='%(asctime)s %(levelname)s %(name)s %(message)s')
     if len(sys.argv) > 1 and sys.argv[1] == 'health':
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
@@ -436,9 +670,14 @@ def main():
                 return 0 if json.load(r)['ready'] else 1
         except Exception:
             return 1
-    # Refuse a different major/minor/patch, rather than validate against the wrong core.
-    require(checked([CORE, 'version']).stdout.splitlines()[0] == b'sing-box version 1.14.2', 'core_version')
-    p = Publisher('/config/settings.json', '/state/snapshot.json')
+    if len(sys.argv) > 1 and sys.argv[1] == 'diagnose':
+        sys.stdout.write(diagnose_report())
+        return 0
+    # Refuse a different major/minor/patch rather than validate against the wrong core.
+    version = checked([CORE, 'version']).stdout.splitlines()[0].decode()
+    require(version == 'sing-box version 1.14.2', 'core_version')
+    LOG.info('starting: %s with %s', SETTINGS_PATH, version)
+    p = Publisher(SETTINGS_PATH, SNAPSHOT_PATH)
     p.restore()
     stop = threading.Event()
     threading.Thread(target=p.loop, args=(stop,), daemon=True).start()

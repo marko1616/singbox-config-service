@@ -13,6 +13,7 @@ services:
       HTTP_PROXY: ${HTTP_PROXY:-${http_proxy:-}}
       HTTPS_PROXY: ${HTTPS_PROXY:-${https_proxy:-}}
       NO_PROXY: ${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}
+      SINGBOX_LOG_LEVEL: ${SINGBOX_LOG_LEVEL:-INFO}
     volumes:
       - ./runtime:/config:ro
       - ./state:/state
