@@ -23,7 +23,7 @@ The old marko-network worktree and its uncommitted edits are untouched.
 
 ## Minimal state machine
 
-1. Load rendered private settings (flat JSON; exactly the shape mounted by Compose).
+1. Load rendered private settings (`devices` list plus `shared` object; exactly the shape mounted by Compose).
 2. Fetch HTTPS subscription, convert locally, classify all matching HK/SG candidates.
 3. Check candidate syntax with pinned core; require Google 204 with an empty body for every candidate.
    Download and hash-check a bounded CacheFly range only for each region's Google-leading shortlist,
@@ -32,10 +32,10 @@ The old marko-network worktree and its uncommitted edits are untouched.
    Probe it only when HK subscription nodes are empty after probing (including no HK entries); then it becomes default only if healthy.
    Singapore has no backup, so an empty or fully failing SG group refuses publication.
    Private manual_nodes are merged with subscription nodes before classification and probing.
-5. Build one client profile; real sing-box check; atomically persist snapshot before making it available.
-6. GET serves only a checked snapshot. Refresh failures keep the previous snapshot, expose only static errors, and retry.
+5. Build one client profile per device from the same selected nodes, with its own WireGuard identity; check every profile with real sing-box, then atomically persist the entire batch.
+6. GET authenticates each device key against current settings and serves only its matching checked profile. Refresh failures keep the previous batch, expose only static errors, and retry.
 
-On restart the snapshot is used only when the rendered settings fingerprint matches and the profile passes the core checker.
+On restart the snapshot is used only when the rendered settings fingerprint and device IDs match and all profiles pass the core checker.
 During normal operation failed refresh retains the old profile even if policy settings changed; `stale` communicates this.
 API authentication is checked against the current rendered settings, independently of the old snapshot key.
 

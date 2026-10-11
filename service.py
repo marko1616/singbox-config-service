@@ -149,6 +149,36 @@ def validate(s):
     return s
 
 
+def device_settings(root):
+    """Validate the two-level document and return effective settings by device id."""
+    require(isinstance(root, dict) and set(root) == {'devices', 'shared'}, 'settings_fields')
+    require(isinstance(root['devices'], list) and 1 <= len(root['devices']) <= 64, 'devices_list')
+    require(isinstance(root['shared'], dict), 'shared_settings')
+    expected = {'subscription_url', 'subscription_user_agent', 'top_k', 'refresh_seconds',
+                'probe_timeout_seconds', 'probe_workers', 'max_candidates', 'hk_pattern',
+                'sg_pattern', 'direct', 'singapore', 'own_hy2', 'manual_nodes'}
+    require(set(root['shared']) == expected, 'shared_settings')
+    result = {}
+    keys, addresses, private_keys = set(), set(), set()
+    for device in root['devices']:
+        require(isinstance(device, dict) and set(device) == {'id', 'api_key', 'wireguard'}, 'device_fields')
+        ident = device['id']
+        require(isinstance(ident, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,64}', ident)
+                and ident not in result, 'device_id')
+        effective = copy.deepcopy(root['shared'])
+        effective.update(api_key=device['api_key'], wireguard=copy.deepcopy(device['wireguard']))
+        validate(effective)
+        require(effective['api_key'] not in keys, 'duplicate_api_key')
+        require(effective['wireguard']['address'] not in addresses, 'duplicate_wireguard_address')
+        require(effective['wireguard']['private_key'] not in private_keys, 'duplicate_wireguard_private_key')
+        keys.add(effective['api_key'])
+        addresses.add(effective['wireguard']['address'])
+        private_keys.add(effective['wireguard']['private_key'])
+        device['wireguard']['address'] = effective['wireguard']['address']
+        result[ident] = effective
+    return result
+
+
 def walk(value):
     if isinstance(value, dict):
         for v in value.values():
@@ -164,7 +194,9 @@ def load_settings(path):
     st = Path(path).stat()
     require(st.st_uid == os.getuid() and st.st_mode & 0o077 == 0, 'settings_owner_permissions')
     require(st.st_size <= LIMIT, 'settings_size')
-    return validate(json.loads(Path(path).read_bytes()))
+    root = json.loads(Path(path).read_bytes())
+    device_settings(root)
+    return root
 
 
 def checked(args, timeout=30):
@@ -181,6 +213,14 @@ def register_secrets(settings):
     if not isinstance(settings, dict):
         return
     values = [settings.get('subscription_url'), settings.get('api_key')]
+    for device in settings.get('devices', []):
+        if isinstance(device, dict):
+            values.append(device.get('api_key'))
+            wg = device.get('wireguard')
+            if isinstance(wg, dict):
+                values.append(wg.get('private_key'))
+    if isinstance(settings.get('shared'), dict):
+        register_secrets(settings['shared'])
     hy2 = settings.get('own_hy2')
     if isinstance(hy2, dict):
         values.append(hy2.get('password'))
@@ -236,7 +276,7 @@ def diagnose_report(settings_path=None, fetcher=None):
     lines.append(json.dumps({k: ('set' if os.environ.get(k) else 'unset') for k in proxy_keys}))
     lines.append('--- live subscription fetch (uses this container network) ---')
     try:
-        s = load_settings(settings_path or SETTINGS_PATH)
+        s = load_settings(settings_path or SETTINGS_PATH)['shared']
     except Exception as exc:
         lines.append('settings unusable: ' + type(exc).__name__ + ': ' +
                      (str(exc) if isinstance(exc, Invalid) else 'load_failed'))
@@ -545,9 +585,12 @@ class Publisher:
             s = load_settings(self.settings)
             obj = json.loads(self.snapshot.read_bytes())
             require(obj['fingerprint'] == hashlib.sha256(encode(s)).hexdigest(), 'snapshot_settings_changed')
-            self.checker(obj['profile'])
+            devices = device_settings(s)
+            require(set(obj['profiles']) == set(devices), 'snapshot_devices_changed')
+            for profile in obj['profiles'].values():
+                self.checker(profile)
             with self.lock:
-                self.data, self.updated, self.summary = encode(obj['profile']), obj['updated'], obj['summary']
+                self.data, self.updated, self.summary = {k: encode(v) for k, v in obj['profiles'].items()}, obj['updated'], obj['summary']
         except Exception:
             pass  # Never serve an unvalidated or mismatched snapshot.
 
@@ -556,27 +599,30 @@ class Publisher:
         s = None
         try:
             s = load_settings(self.settings)
+            devices = device_settings(s)
+            shared = s['shared']
             stage = 'fetch'
-            data = self.fetcher(s)
+            data = self.fetcher(shared)
             stage = 'convert'
             nodes = self.converter(data)
-            if s['manual_nodes']:
-                extra = self.converter(('\n'.join(s['manual_nodes']) + '\n').encode())
+            if shared['manual_nodes']:
+                extra = self.converter(('\n'.join(shared['manual_nodes']) + '\n').encode())
                 # A dropped manual entry must not silently reduce the candidate set.
-                require(len(extra) == len(s['manual_nodes']), 'manual_node_rejected')
+                require(len(extra) == len(shared['manual_nodes']), 'manual_node_rejected')
                 nodes = merge_nodes(nodes, extra)
             stage = 'select'
-            chosen, summary = select(nodes, s, self.measure, self.checker)
+            chosen, summary = select(nodes, next(iter(devices.values())), self.measure, self.checker)
             stage = 'check'
-            p = build_profile(s, chosen)
-            self.checker(p)
+            profiles = {ident: build_profile(settings, chosen) for ident, settings in devices.items()}
+            for profile in profiles.values():
+                self.checker(profile)
             stage = 'publish'
             updated = int(time.time())
-            snapshot = {'fingerprint': hashlib.sha256(encode(s)).hexdigest(), 'profile': p,
+            snapshot = {'fingerprint': hashlib.sha256(encode(s)).hexdigest(), 'profiles': profiles,
                         'updated': updated, 'summary': summary}
             atomic_write(self.snapshot, encode(snapshot))
             with self.lock:
-                self.data, self.updated, self.summary = encode(p), updated, summary
+                self.data, self.updated, self.summary = {k: encode(v) for k, v in profiles.items()}, updated, summary
                 self.error, self.stage = None, 'ready'
             counts = summary['counts']
             LOG.info('published hk_retained=%s hk_tested=%s sg_retained=%s sg_tested=%s fallback=%s',
@@ -603,7 +649,7 @@ class Publisher:
         while not stop.is_set():
             self.refresh()
             try:
-                interval = load_settings(self.settings)['refresh_seconds']
+                interval = load_settings(self.settings)['shared']['refresh_seconds']
             except Exception:
                 interval = 30
             stop.wait(interval)
@@ -637,18 +683,19 @@ def handler_for(publisher):
                 return
             try:
                 # Auth always uses the current settings, not a cached/old key.
-                key = load_settings(publisher.settings)['api_key']
+                settings = load_settings(publisher.settings)
                 query = urllib.parse.parse_qs(u.query, strict_parsing=True)
                 header = self.headers.get('Authorization', '')
                 supplied = header[7:] if header.startswith('Bearer ') else query.get('key', [''])[0]
-                valid = hmac.compare_digest(key.encode(), supplied.encode())
+                ident = next((d['id'] for d in settings['devices']
+                              if hmac.compare_digest(d['api_key'], supplied)), None)
             except Exception:
-                valid = False
-            if not valid:
+                ident = None
+            if ident is None:
                 self.reply(401, b'{"error":"unauthorized"}')
                 return
             with publisher.lock:
-                data = publisher.data
+                data = publisher.data.get(ident) if publisher.data else None
             self.reply(200 if data else 503, data or b'{"error":"not_ready"}')
 
         def do_POST(self):

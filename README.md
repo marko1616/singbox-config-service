@@ -1,7 +1,26 @@
 # sing-box 单功能配置下发服务
 
 新仓库，目标为 **sing-box Android 1.14.2**。没有复制旧 marko-network 的实现、密钥、服务配置或 Git 历史。
-只生成并下发一个客户端配置，不部署或修改 WireGuard 服务端、VPS、DDNS、frp、Apache 或宿主路由。
+每台设备生成并下发一份客户端配置，不部署或修改 WireGuard 服务端、VPS、DDNS、frp、Apache 或宿主路由。
+
+## 多设备私有配置
+
+`private-config/settings.json` 顶层恰好包含 `devices`（1–64 个设备的列表）和 `shared`（服务器共有设置对象）。
+每个设备必须有唯一 `id`、`api_key` 和完整 `wireguard`；WireGuard 客户端地址、私钥也不能复用。
+订阅地址、测速参数、规则、手动节点和自有 hy2 放在 `shared`，只拉取、转换和测速一次。
+所有设备配置都经 sing-box 校验后，才作为一份快照原子发布；一台设备失败就保留整组旧快照。
+原有 `/api/config?key=<API_KEY>` URL 不变，key 自动识别设备并只返回该设备的配置。
+`/healthz` 仍只显示整体状态，不列设备或密钥。添加设备前，先在 WireGuard 服务端分配独立 peer。
+
+从旧版扁平 `private-config/settings.json` 转换：在仓库根目录执行以下一次性命令。
+它验证旧格式，保留 `settings.json.bak`（已有备份时拒绝覆盖），再以原权限原子写入新格式；不会自动部署。
+
+```sh
+python3 -c 'import json,os,shutil,tempfile; from pathlib import Path; from service import validate,device_settings,encode; p=Path("private-config/settings.json"); s=json.loads(p.read_bytes()); validate(s); b=p.with_name(p.name+".bak"); assert not b.exists(), "backup already exists"; d={"id":"phone","api_key":s.pop("api_key"),"wireguard":s.pop("wireguard")}; new={"devices":[d],"shared":s}; device_settings(new); shutil.copy2(p,b); fd,tmp=tempfile.mkstemp(dir=p.parent,prefix=".settings-"); os.fchmod(fd,p.stat().st_mode & 0o777); f=os.fdopen(fd,"wb"); f.write(encode(new)); f.flush(); os.fsync(f.fileno()); f.close(); os.replace(tmp,p); print("converted:",p,"backup:",b)'
+```
+
+转换后用编辑器改 `id`、追加其他设备及其独立凭据，再执行 `python3 cli.py render`，最后按原部署流程重启容器。
+首次多设备部署会使旧单设备快照的格式失效；新服务成功刷新前返回 503，建议保留客户端原有可用配置。
 
 ## 固定合同
 
@@ -50,7 +69,7 @@ Show service status / Exit。
 同一批动作也可直接调用：`init`、`render`、`build`、`up`、`down`、`logs`、`status`，仅用标准库。
 
 1. 选择 Initialize，生成 `private-config/settings.json`。已有文件绝不覆盖。
-2. 用 Neovim 或其他编辑器填写占位符：订阅 URL、API key、WG 客户端地址（/32）及密钥、WG endpoint、自有 hy2。
+2. 用 Neovim 或其他编辑器填写占位符：`shared` 中的订阅 URL、自有 hy2，以及 `devices` 中每台设备的 API key、WG 客户端地址（/32）及密钥、WG endpoint。
 3. `api_key` 必须为 **32–128 个 URL-safe 字符**：`A-Z a-z 0-9 _ -`。因为该 key 会出现在订阅 URL 的查询串里，
    `+ / = !` 等字符被拒绝（基密码管理器生成、带 `=+/` 的 base64 串会直接报 `api_key_format`）。
 4. 填写 `singapore` 白名单。`direct` 可加个人强制直连条目，与内置列表合并。
@@ -90,7 +109,7 @@ Show service status / Exit。
 ## 唯一业务接口
 
 - 方法：**GET**
-- URL：`https://<你的配置域名>/api/config?key=<API_KEY>`，适用于只接受订阅 URL 的客户端。
+- URL：`https://<你的配置域名>/api/config?key=<该设备的 API_KEY>`，适用于只接受订阅 URL 的客户端。
 - 也支持 `Authorization: Bearer <API_KEY>`，此时 URL 不需要 key 参数。
 - 成功 200：完整 sing-box JSON；密钥错误 401；尚无有效配置 503；POST 405。
 - `/healthz` 仅返回 ready/stale、刷新阶段、静态错误码、数量、是否启用 hy2，不输出节点、密钥或订阅地址。

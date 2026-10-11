@@ -20,8 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def settings():
-    s = json.loads((ROOT / 'templates/private-config/settings.json').read_bytes())
+    root = json.loads((ROOT / 'templates/private-config/settings.json').read_bytes())
+    s = root['shared']
     s.update(api_key='test_' + 'x' * 40, subscription_url='https://subscription.example.invalid/feed')
+    s['wireguard'] = root['devices'][0]['wireguard']
     s['wireguard'].update(address='10.77.0.2/32', private_key=base64.b64encode(bytes(range(32))).decode(),
                           peer_public_key=base64.b64encode(bytes(range(1, 33))).decode(), endpoint='wg.example.invalid')
     s['own_hy2'].update(server='hk.example.invalid', password='synthetic-password',
@@ -30,6 +32,21 @@ def settings():
     s['singapore'] = {'domain': ['exact.example.invalid'], 'domain_suffix': ['sg.example.invalid'],
                       'ip_cidr': ['203.0.113.0/24', '2001:db8::/32']}
     return s
+
+
+def root_settings(s=None):
+    s = copy.deepcopy(s if s is not None else settings())
+    return {'devices': [{'id': 'phone', 'api_key': s.pop('api_key'), 'wireguard': s.pop('wireguard')}],
+            'shared': s}
+
+
+def add_second_device(root):
+    other = copy.deepcopy(root['devices'][0])
+    other.update(id='tablet', api_key='tablet_' + 'y' * 40)
+    other['wireguard'].update(address='10.77.0.3/32',
+                              private_key=base64.b64encode(bytes(range(32, 64))).decode())
+    root['devices'].append(other)
+    return root
 
 
 def nodes():
@@ -167,9 +184,20 @@ class SelectionTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_multidevice_identity_uniqueness_and_shape(self):
+        root = add_second_device(root_settings())
+        self.assertEqual(set(m.device_settings(root)), {'phone', 'tablet'})
+        for field, value, error in [('api_key', root['devices'][0]['api_key'], 'duplicate_api_key'),
+                                    ('id', 'phone', 'device_id')]:
+            bad = copy.deepcopy(root); bad['devices'][1][field] = value
+            with self.assertRaisesRegex(m.Invalid, error): m.device_settings(bad)
+        bad = copy.deepcopy(root)
+        bad['devices'][1]['wireguard']['address'] = '10.77.0.2'
+        with self.assertRaisesRegex(m.Invalid, 'duplicate_wireguard_address'): m.device_settings(bad)
+
     def test_validate_rejects_placeholders_ipv4_endpoint_bad_key(self):
         with self.assertRaises(m.Invalid):
-            m.validate(json.loads((ROOT / 'templates/private-config/settings.json').read_bytes()))
+            m.device_settings(json.loads((ROOT / 'templates/private-config/settings.json').read_bytes()))
         s = settings(); m.validate(s)
         s['wireguard']['endpoint'] = '192.0.2.1'
         with self.assertRaises(m.Invalid): m.validate(s)
@@ -234,7 +262,7 @@ class PublisherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.s = settings()
+        self.s = root_settings()
         self.settings = self.root / 'settings.json'
         m.atomic_write(self.settings, m.encode(self.s))
         self.p = m.Publisher(self.settings, self.root / 'snapshot.json', fetcher=lambda s: b'fixture',
@@ -252,6 +280,41 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(q.data, old)
         self.assertEqual(self.p.snapshot.stat().st_mode & 0o777, 0o600)
 
+    def test_two_devices_share_probe_but_receive_distinct_checked_profiles(self):
+        self.s = add_second_device(self.s)
+        m.atomic_write(self.settings, m.encode(self.s))
+        calls = []
+        self.p.measure = lambda n, s: calls.append(n['tag']) or 1
+        self.assertTrue(self.p.refresh(), self.p.status())
+        self.assertEqual(set(self.p.data), {'phone', 'tablet'})
+        phone = json.loads(self.p.data['phone'])
+        tablet = json.loads(self.p.data['tablet'])
+        self.assertEqual(len(calls), 10)
+        self.assertEqual(phone['endpoints'][0]['address'], ['10.77.0.2/32'])
+        self.assertEqual(tablet['endpoints'][0]['address'], ['10.77.0.3/32'])
+        self.assertNotEqual(phone['endpoints'][0]['private_key'], tablet['endpoints'][0]['private_key'])
+        restored = m.Publisher(self.settings, self.p.snapshot); restored.restore()
+        self.assertEqual(restored.data, self.p.data)
+        self.s['devices'].pop()
+        m.atomic_write(self.settings, m.encode(self.s))
+        changed = m.Publisher(self.settings, self.p.snapshot); changed.restore()
+        self.assertIsNone(changed.data)
+
+    def test_one_device_check_failure_preserves_previous_batch(self):
+        self.assertTrue(self.p.refresh())
+        old = self.p.data
+        old_snapshot = self.p.snapshot.read_bytes()
+        self.s = add_second_device(self.s)
+        m.atomic_write(self.settings, m.encode(self.s))
+        def reject_tablet(profile):
+            if profile.get('endpoints') and profile['endpoints'][0]['address'] == ['10.77.0.3/32']:
+                raise m.Invalid('tablet_check_failed')
+        self.p.checker = reject_tablet
+        self.assertFalse(self.p.refresh())
+        self.assertEqual(self.p.data, old)
+        self.assertEqual(self.p.snapshot.read_bytes(), old_snapshot)
+        self.assertEqual(self.p.status()['error'], 'tablet_check_failed')
+
     def test_invalid_then_fixed_settings_recover(self):
         m.atomic_write(self.settings, b'{}')
         self.assertFalse(self.p.refresh())
@@ -261,7 +324,7 @@ class PublisherTests(unittest.TestCase):
 
     def test_changed_settings_do_not_restore_old_snapshot(self):
         self.assertTrue(self.p.refresh())
-        self.s['api_key'] = 'y' * 40
+        self.s['devices'][0]['api_key'] = 'y' * 40
         m.atomic_write(self.settings, m.encode(self.s))
         q = m.Publisher(self.settings, self.p.snapshot); q.restore()
         self.assertIsNone(q.data)
@@ -278,17 +341,31 @@ class PublisherTests(unittest.TestCase):
             except urllib.error.HTTPError as e: response = e
             with response: return response.status, response.read()
         self.assertEqual(request('/api/config')[0], 401)
-        self.assertEqual(request('/api/config', self.s['api_key'])[0], 503)
+        self.assertEqual(request('/api/config', self.s['devices'][0]['api_key'])[0], 503)
         self.assertEqual(json.loads(request('/healthz')[1])['ready'], False)
         self.assertTrue(self.p.refresh())
-        for url, key in [('/api/config', self.s['api_key']), ('/api/config?key=' + self.s['api_key'], None)]:
+        for url, key in [('/api/config', self.s['devices'][0]['api_key']), ('/api/config?key=' + self.s['devices'][0]['api_key'], None)]:
             status, data = request(url, key)
-            self.assertEqual(status, 200); self.assertEqual(data, self.p.data)
-        self.assertEqual(request('/api/config', self.s['api_key'], 'POST')[0], 405)
-        old = self.s['api_key']; self.s['api_key'] = 'new_' + 'y' * 40
+            self.assertEqual(status, 200); self.assertEqual(data, self.p.data['phone'])
+        self.assertEqual(request('/api/config', self.s['devices'][0]['api_key'], 'POST')[0], 405)
+        old = self.s['devices'][0]['api_key']; self.s['devices'][0]['api_key'] = 'new_' + 'y' * 40
         m.atomic_write(self.settings, m.encode(self.s))
         self.assertEqual(request('/api/config', old)[0], 401)
-        self.assertEqual(request('/api/config', self.s['api_key'])[0], 200)
+        self.assertEqual(request('/api/config', self.s['devices'][0]['api_key'])[0], 200)
+
+    def test_http_keys_are_device_scoped(self):
+        self.s = add_second_device(self.s)
+        m.atomic_write(self.settings, m.encode(self.s))
+        self.assertTrue(self.p.refresh(), self.p.status())
+        server = ThreadingHTTPServer(('127.0.0.1', 0), m.handler_for(self.p))
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for ident, device in [('phone', self.s['devices'][0]), ('tablet', self.s['devices'][1])]:
+            req = urllib.request.Request(f'http://127.0.0.1:{server.server_port}/api/config?key={device["api_key"]}')
+            with opener.open(req, timeout=2) as response:
+                self.assertEqual(response.read(), self.p.data[ident])
+        self.assertNotEqual(self.p.data['phone'], self.p.data['tablet'])
 
 
 class RenderTests(unittest.TestCase):
@@ -300,12 +377,12 @@ class RenderTests(unittest.TestCase):
             target = cli.initialize(r)
             with self.assertRaises(FileExistsError): cli.initialize(r)
             with self.assertRaises(m.Invalid): cli.render(r)
-            s = settings(); s['direct'] = {'domain': ['extra.example.invalid'], 'domain_suffix': [], 'ip_cidr': []}
+            s = root_settings(); s['shared']['direct'] = {'domain': ['extra.example.invalid'], 'domain_suffix': [], 'ip_cidr': []}
             m.atomic_write(target, m.encode(s))
             out = cli.render(r)
             result = m.load_settings(out)
-            self.assertIn('extra.example.invalid', result['direct']['domain'])
-            self.assertEqual(len(result['direct']['ip_cidr']), 35)
+            self.assertIn('extra.example.invalid', result['shared']['direct']['domain'])
+            self.assertEqual(len(result['shared']['direct']['ip_cidr']), 35)
             self.assertEqual(out.stat().st_mode & 0o777, 0o600)
             self.assertEqual(out.parent.stat().st_mode & 0o777, 0o700)
             self.assertIn(f'LOCAL_UID={os.getuid()}', (r / '.env').read_text())
@@ -427,7 +504,7 @@ class DiagnosticsTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         s = settings()
-        sp = root / "settings.json"; m.atomic_write(sp, m.encode(s))
+        sp = root / "settings.json"; m.atomic_write(sp, m.encode(root_settings(s)))
         def checker(profile):
             m.checked(["/bin/sh", "-c", "echo DETAIL-ONLY-IN-LOGS >&2; exit 2"])
         p = m.Publisher(sp, root / "snapshot.json", fetcher=lambda s: b"sub",
@@ -459,7 +536,7 @@ class DiagnosticsTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         s = settings()
-        sp = root / "settings.json"; m.atomic_write(sp, m.encode(s))
+        sp = root / "settings.json"; m.atomic_write(sp, m.encode(root_settings(s)))
         def bad_fetch(settings_arg):
             raise urllib.error.URLError("timed out fetching " + settings_arg["subscription_url"])
         p = m.Publisher(sp, root / "snapshot.json", fetcher=bad_fetch, converter=lambda b: nodes(),
@@ -478,7 +555,7 @@ class DiagnosticsTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         s = settings()
-        sp = root / "settings.json"; m.atomic_write(sp, m.encode(s))
+        sp = root / "settings.json"; m.atomic_write(sp, m.encode(root_settings(s)))
         def bad_fetch(settings_arg):
             raise urllib.error.URLError("name resolution failed for " + settings_arg["subscription_url"])
         with patch.dict(os.environ, {"HTTPS_PROXY": "http://proxy-should-not-appear:1"}):
@@ -507,7 +584,7 @@ class DiagnosticsTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         s = settings()
-        sp = root / "settings.json"; m.atomic_write(sp, m.encode(s))
+        sp = root / "settings.json"; m.atomic_write(sp, m.encode(root_settings(s)))
         def reject_on_final(profile):
             # select() checks the candidate list first; only the final profile carries rule_set.
             if "rule_set" in profile.get("route", {}):
@@ -527,7 +604,7 @@ class DiagnosticsTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         s = settings()
-        sp = root / "settings.json"; m.atomic_write(sp, m.encode(s))
+        sp = root / "settings.json"; m.atomic_write(sp, m.encode(root_settings(s)))
         p = m.Publisher(sp, root / "snapshot.json", fetcher=lambda s: b"sub",
                         converter=lambda b: nodes(), measure=lambda n, s: 1, checker=m.check_profile)
         with self.assertLogs(m.LOG, level="INFO") as captured:
@@ -570,7 +647,7 @@ class ManualNodeTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         s = settings(); s["manual_nodes"] = ["trojan://x@hk.example.invalid:443#HK manual"]
-        sp = root / "settings.json"; m.atomic_write(sp, m.encode(s))
+        sp = root / "settings.json"; m.atomic_write(sp, m.encode(root_settings(s)))
         calls = []
         def convert(data):
             calls.append(data)

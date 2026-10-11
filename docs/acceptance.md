@@ -31,15 +31,17 @@
 | Config syntax | Real 1.14.2 accepts normal/backup, populated/empty SG whitelist variants |
 | Conversion | Real v1.0.4 converts plain/base64 URI feeds; bad input rejected |
 | Auth / readiness | Real local HTTP API: 401 before auth, 503 before ready, 200 valid Bearer/URL key, 405 POST, old key rejected after rotation |
+| Multi-device isolation | Two synthetic devices with distinct keys receive distinct WG addresses/private keys; their HTTP responses match only their device; subscription probe runs once for the batch |
+| Multi-device failure/restore | Duplicate IDs, keys and WG addresses rejected; one device's failed profile check keeps the previous batch; matched snapshot restores both, changed device list cannot restore |
 | Refresh failures | Last valid profile remains byte-identical, static errors do not contain secret fixture text |
 | Recovery / restart | Invalid settings corrected then publish; matched restart snapshot restored; settings mismatch refused |
-| Render / mounts | Same flat settings shape as Compose; 0600 files, 0700 directories, owner UID/GID; existing private template not overwritten |
+| Render / mounts | Same two-level settings shape as Compose; 0600 files, 0700 directories, owner UID/GID; existing private template not overwritten |
 
 ## Required on the actual host/client (NOT executed)
 
 1. Docker build and startup, including base image/build/runtime proxy paths; actual UID/mount access.
    Confirm `SINGBOX_LOG_LEVEL=DEBUG` at `up` recreates the service with per-node diagnostics; return to INFO afterward.
-2. HTTPS URL from SFA, automatic refresh/apply behavior, no key-bearing reverse-proxy logs.
+2. HTTPS URL from each SFA device, automatic refresh/apply behavior, no key-bearing reverse-proxy logs. Confirm every device gets only its own WG address/key; old single-device snapshot intentionally cannot restore after migration.
 3. Real subscription classification, proxy protocols, Google HTTPS probe results from the container.
 4. Real HK subscription → own hy2 → recovered HK transitions, followed by client refresh and an actual business request.
 5. SG whitelist HTTP/TLS requests and DNS routing; DIRECT public DNS requests; ordinary mainland sites must still go HK unless listed.

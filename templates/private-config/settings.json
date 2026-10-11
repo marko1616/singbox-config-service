@@ -1,29 +1,47 @@
 {
-  "api_key": "<REPLACE_WITH_RANDOM_KEY_AT_LEAST_32_CHARACTERS>",
-  "subscription_url": "<HTTPS_SUBSCRIPTION_URL>",
-  "subscription_user_agent": "v2rayNG",
-  "top_k": 3,
-  "refresh_seconds": 300,
-  "probe_timeout_seconds": 10,
-  "probe_workers": 4,
-  "max_candidates": 200,
-  "hk_pattern": "(?i)(香港|Hong.?Kong|\\bHK\\b|🇭🇰)",
-  "sg_pattern": "(?i)(新加坡|Singapore|\\bSG\\b|🇸🇬)",
-  "manual_nodes": [],
-  "direct": {"ip_cidr": [], "domain": [], "domain_suffix": []},
-  "singapore": {"ip_cidr": [], "domain": [], "domain_suffix": []},
-  "wireguard": {
-    "address": "<CLIENT_OVERLAY_IPV4_CIDR>",
-    "private_key": "<CLIENT_PRIVATE_KEY>",
-    "peer_public_key": "<SERVER_PUBLIC_KEY>",
-    "endpoint": "<SERVER_DDNS_HOST_OR_PUBLIC_IPV6>",
-    "port": 51820,
-    "mtu": 1280
-  },
-  "own_hy2": {
-    "server": "<OWN_HK_SERVER>",
-    "server_port": 443,
-    "password": "<OWN_HK_PASSWORD>",
-    "tls": {"enabled": true, "server_name": "<OWN_HK_TLS_SERVER_NAME>"}
+  "devices": [
+    {
+      "id": "phone",
+      "api_key": "<REPLACE_WITH_RANDOM_KEY_AT_LEAST_32_CHARACTERS>",
+      "wireguard": {
+        "address": "<CLIENT_OVERLAY_IPV4_CIDR>",
+        "private_key": "<CLIENT_PRIVATE_KEY>",
+        "peer_public_key": "<SERVER_PUBLIC_KEY>",
+        "endpoint": "<SERVER_DDNS_HOST_OR_PUBLIC_IPV6>",
+        "port": 51820,
+        "mtu": 1280
+      }
+    }
+  ],
+  "shared": {
+    "subscription_url": "<HTTPS_SUBSCRIPTION_URL>",
+    "subscription_user_agent": "v2rayNG",
+    "top_k": 3,
+    "refresh_seconds": 300,
+    "probe_timeout_seconds": 10,
+    "probe_workers": 4,
+    "max_candidates": 200,
+    "hk_pattern": "(?i)(香港|Hong.?Kong|\\bHK\\b|🇭🇰)",
+    "sg_pattern": "(?i)(新加坡|Singapore|\\bSG\\b|🇸🇬)",
+    "manual_nodes": [],
+    "direct": {
+      "ip_cidr": [],
+      "domain": [],
+      "domain_suffix": []
+    },
+    "singapore": {
+      "ip_cidr": [],
+      "domain": [],
+      "domain_suffix": []
+    },
+    "own_hy2": {
+      "server": "<OWN_HK_SERVER>",
+      "server_port": 443,
+      "password": "<OWN_HK_PASSWORD>",
+      "tls": {
+        "enabled": true,
+        "server_name": "<OWN_HK_TLS_SERVER_NAME>"
+      }
+    }
   }
 }

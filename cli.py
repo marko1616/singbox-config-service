@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 
-from service import Invalid, atomic_write, encode, load_settings, validate
+from service import Invalid, atomic_write, encode, load_settings, device_settings
 
 ROOT = Path(__file__).resolve().parent
 PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")
@@ -31,6 +31,13 @@ ERROR_HELP = {
     "api_key_format": "api_key must be 32-128 URL-safe characters: A-Z a-z 0-9 _ -",
     "settings_owner_permissions": "private-config/settings.json must be owned by you, mode 0600",
     "settings_fields": "settings.json has missing or unexpected top-level keys",
+    "devices_list": "devices must contain 1-64 device objects",
+    "device_fields": "each device needs id, api_key and wireguard",
+    "device_id": "device id must be unique and use 1-64 URL-safe characters",
+    "shared_settings": "shared must contain exactly the server-wide settings",
+    "duplicate_api_key": "each device needs a distinct api_key",
+    "duplicate_wireguard_address": "each device needs a distinct WireGuard address",
+    "duplicate_wireguard_private_key": "each device needs a distinct WireGuard private key",
     "rule_fields": "direct/singapore must each contain ip_cidr, domain and domain_suffix",
     "manual_nodes_list": "manual_nodes must be a list of at most 200 URI strings",
     "manual_node_entry": "each manual_nodes entry must be one single-line URI string",
@@ -92,8 +99,8 @@ def render(root=ROOT):
     s = copy.deepcopy(load_settings(root / "private-config/settings.json"))
     builtin = json.loads((root / "data/direct.json").read_bytes())
     for field in builtin:
-        s["direct"][field] = sorted(set(builtin[field] + s["direct"][field]))
-    validate(s)
+        s["shared"]["direct"][field] = sorted(set(builtin[field] + s["shared"]["direct"][field]))
+    device_settings(s)
     for name in ("runtime", "state"):
         private_dir(root / name)
     # Atomic replace: the read-only bind mount always sees a complete file.
