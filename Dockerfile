@@ -17,5 +17,6 @@ RUN test "$(dpkg --print-architecture)" = amd64 && \
     sing-box version
 WORKDIR /app
 COPY service.py /app/service.py
+COPY data/geoip-foreign.srs /app/data/geoip-foreign.srs
 EXPOSE 8787
 CMD ["python3", "/app/service.py"]

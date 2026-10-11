@@ -47,6 +47,36 @@ class LocalNetworkTests(unittest.TestCase):
     def node(self, server, tag):
         return {'type': 'http', 'tag': tag, 'server': '127.0.0.1', 'server_port': server.server_address[1]}
 
+    def test_proxyonly_mixed_inbound_accepts_http_and_socks(self):
+        hk, sg = self.server('HK'), self.server('SG')
+        s = settings()
+        chosen = {'hk': [self.node(hk, 'hk-node')], 'sg': [self.node(sg, 'sg-node')]}
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
+        p = m.variant_profile(m.build_profile(s, chosen), 'global', False,
+                              m.proxy_options({'port': [str(port)]}))
+        p['dns']['servers'] = [{'type': 'local', 'tag': tag} for tag in ['bootstrap', 'dns-hk', 'dns-sg']]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'runtime.json'; path.write_bytes(m.encode(p))
+            proc = subprocess.Popen([m.CORE, 'run', '-c', str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                for _ in range(100):
+                    if proc.poll() is not None:
+                        self.fail(proc.stderr.read().decode())
+                    try:
+                        with socket.create_connection(('127.0.0.1', port), timeout=.1): break
+                    except OSError: time.sleep(.03)
+                else: self.fail('core did not start')
+                for proxy in (f'http://127.0.0.1:{port}', f'socks5h://127.0.0.1:{port}'):
+                    result = subprocess.run(['curl', '--silent', '--show-error', '--fail', '--proxy', proxy,
+                                             '--noproxy', '', '--max-time', '3',
+                                             f'http://127.0.0.3:{hk.server_address[1]}/test'],
+                                            capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, (proxy, result.stderr))
+                    self.assertEqual(result.stdout, b'HK')
+            finally:
+                proc.terminate(); proc.wait(timeout=3); proc.stderr.close()
+
     def test_actual_probe_uses_outbound_despite_no_proxy(self):
         proxy = self.server('proxied')
         with patch.dict(os.environ, {'NO_PROXY': '*', 'no_proxy': '*', 'HTTPS_PROXY': 'http://127.0.0.1:1'}):

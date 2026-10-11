@@ -27,6 +27,13 @@ CACHEFLY_URL = "https://cachefly.cachefly.net/1mb.test"
 CACHEFLY_BYTES = 131072
 CACHEFLY_SHA256 = "fa43239bcee7b97ca62f007cc68487560a39e19f74f3dde7486db3f98df8e471"
 OVERLAY = "10.77.0.0/24"
+CONFIG_PATHS = {f'/api/config-{mode}-{scope}': (mode, scope == 'full')
+                for mode in ('global', 'blacklist', 'whitelist')
+                for scope in ('full', 'proxyonly')}
+GEOIP_CN_URL = 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs'
+GEOSITE_CN_URL = 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs'
+GEOSITE_FOREIGN_URL = 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs'
+FOREIGN_RULE_PATH = Path(__file__).resolve().parent / 'data/geoip-foreign.srs'
 LIMIT = 8 * 1024 * 1024
 # Everything goes to stdout/docker logs; nothing diagnostic is written to the host.
 LOG = logging.getLogger('singbox-config-service')
@@ -89,7 +96,7 @@ def validate(s):
     fields = {"api_key", "subscription_url", "subscription_user_agent", "top_k", "refresh_seconds",
               "probe_timeout_seconds", "probe_workers", "max_candidates", "hk_pattern", "sg_pattern",
               "direct", "singapore", "wireguard", "own_hy2", "manual_nodes"}
-    require(set(s) == fields, "settings_fields")
+    require(set(s) in (fields, fields - {'wireguard'}), "settings_fields")
     require(not any(isinstance(v, str) and v.startswith('<') for v in walk(s)), "unfilled_template")
     require(isinstance(s['api_key'], str) and re.fullmatch(r'[A-Za-z0-9_-]{32,128}', s['api_key']), "api_key_format")
     u = urllib.parse.urlsplit(s['subscription_url'])
@@ -117,23 +124,23 @@ def validate(s):
                     ipaddress.ip_network(v, strict=False)
                 else:
                     domain(v)
-    w = s['wireguard']
-    require(set(w) == {'address', 'private_key', 'peer_public_key', 'endpoint', 'port', 'mtu'}, 'wireguard_fields')
-    address = ipaddress.ip_interface(w['address'])
-    require(address.version == 4 and address.ip in ipaddress.ip_network(OVERLAY) and address.network.prefixlen == 32, 'wireguard_address_must_be_host_32')
-    # ip_interface() defaults a bare IP to /32, but sing-box's netip.ParsePrefix
-    # needs an explicit mask, so normalise here and in the emitted profile.
-    w['address'] = str(address)
-    for key in ('private_key', 'peer_public_key'):
-        require(len(base64.b64decode(w[key], validate=True)) == 32, 'wireguard_key')
-    try:
-        endpoint = ipaddress.ip_address(w['endpoint'])
-    except ValueError:
-        domain(w['endpoint'])
-    else:
-        require(endpoint.version == 6 and endpoint.is_global, 'wireguard_public_ipv6_required')
-    require(type(w['port']) is int and 1 <= w['port'] <= 65535, 'wireguard_port')
-    require(type(w['mtu']) is int and 1280 <= w['mtu'] <= 1420, 'wireguard_mtu')
+    w = s.get('wireguard')
+    if w is not None:
+        require(isinstance(w, dict) and set(w) == {'address', 'private_key', 'peer_public_key', 'endpoint', 'port', 'mtu'}, 'wireguard_fields')
+        address = ipaddress.ip_interface(w['address'])
+        require(address.version == 4 and address.ip in ipaddress.ip_network(OVERLAY) and address.network.prefixlen == 32, 'wireguard_address_must_be_host_32')
+        # sing-box's netip.ParsePrefix needs an explicit mask.
+        w['address'] = str(address)
+        for key in ('private_key', 'peer_public_key'):
+            require(len(base64.b64decode(w[key], validate=True)) == 32, 'wireguard_key')
+        try:
+            endpoint = ipaddress.ip_address(w['endpoint'])
+        except ValueError:
+            domain(w['endpoint'])
+        else:
+            require(endpoint.version == 6 and endpoint.is_global, 'wireguard_public_ipv6_required')
+        require(type(w['port']) is int and 1 <= w['port'] <= 65535, 'wireguard_port')
+        require(type(w['mtu']) is int and 1280 <= w['mtu'] <= 1420, 'wireguard_mtu')
     h = s['own_hy2']
     require(set(h) == {'server', 'server_port', 'password', 'tls'}, 'hy2_fields')
     require(isinstance(h['server'], str) and h['server'], 'hy2_server')
@@ -161,20 +168,21 @@ def device_settings(root):
     result = {}
     keys, addresses, private_keys = set(), set(), set()
     for device in root['devices']:
-        require(isinstance(device, dict) and set(device) == {'id', 'api_key', 'wireguard'}, 'device_fields')
+        require(isinstance(device, dict) and set(device) in ({'id', 'api_key'}, {'id', 'api_key', 'wireguard'}), 'device_fields')
         ident = device['id']
         require(isinstance(ident, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,64}', ident)
                 and ident not in result, 'device_id')
         effective = copy.deepcopy(root['shared'])
-        effective.update(api_key=device['api_key'], wireguard=copy.deepcopy(device['wireguard']))
+        effective.update(api_key=device['api_key'], wireguard=copy.deepcopy(device.get('wireguard')))
         validate(effective)
         require(effective['api_key'] not in keys, 'duplicate_api_key')
-        require(effective['wireguard']['address'] not in addresses, 'duplicate_wireguard_address')
-        require(effective['wireguard']['private_key'] not in private_keys, 'duplicate_wireguard_private_key')
         keys.add(effective['api_key'])
-        addresses.add(effective['wireguard']['address'])
-        private_keys.add(effective['wireguard']['private_key'])
-        device['wireguard']['address'] = effective['wireguard']['address']
+        if effective['wireguard'] is not None:
+            require(effective['wireguard']['address'] not in addresses, 'duplicate_wireguard_address')
+            require(effective['wireguard']['private_key'] not in private_keys, 'duplicate_wireguard_private_key')
+            addresses.add(effective['wireguard']['address'])
+            private_keys.add(effective['wireguard']['private_key'])
+            device['wireguard']['address'] = effective['wireguard']['address']
         result[ident] = effective
     return result
 
@@ -526,6 +534,85 @@ def rule_items(rules):
     return [{key: values} for key, values in rules.items() if values]
 
 
+def proxy_options(query):
+    """Validate subscription URL options without ever reflecting supplied values."""
+    require(set(query) <= {'key', 'port', 'user', 'password', 'listen'}, 'invalid_query_parameter')
+    require(all(len(values) == 1 for values in query.values()), 'duplicate_query_parameter')
+    port = query.get('port', ['10808'])[0]
+    require(bool(re.fullmatch(r'[0-9]{1,5}', port)) and 1 <= int(port) <= 65535, 'invalid_proxy_port')
+    listen = query.get('listen', ['127.0.0.1'])[0]
+    try:
+        ipaddress.ip_address(listen)
+    except ValueError:
+        raise Invalid('invalid_proxy_listen') from None
+    user, password = query.get('user', [''])[0], query.get('password', [''])[0]
+    require(bool(user) == bool(password), 'proxy_credentials_pair_required')
+    require(len(user) <= 128 and len(password) <= 256 and
+            not any(ord(c) < 33 or ord(c) == 127 for c in user + password), 'invalid_proxy_credentials')
+    inbound = {'type': 'mixed', 'tag': 'mixed-in', 'listen': listen, 'listen_port': int(port)}
+    if user:
+        inbound['users'] = [{'username': user, 'password': password}]
+    return inbound
+
+
+def remote_set(tag, url):
+    return {'type': 'remote', 'tag': tag, 'format': 'binary', 'url': url,
+            'download_detour': 'hk', 'update_interval': '7d'}
+
+
+def foreign_rule_url(host, key):
+    """Use the subscription host for the authenticated companion rule-set."""
+    require(isinstance(host, str) and len(host) <= 253 and
+            not any(c in host for c in '/?#@\\\r\n\t '), 'invalid_request_host')
+    try:
+        parsed = urllib.parse.urlsplit('//' + host)
+        require(parsed.hostname and parsed.netloc == host and
+                (parsed.port is None or 1 <= parsed.port <= 65535), 'invalid_request_host')
+    except ValueError:
+        raise Invalid('invalid_request_host') from None
+    scheme = 'http' if parsed.hostname in ('localhost', '127.0.0.1', '::1') else 'https'
+    return f'{scheme}://{host}/api/rules/geoip-foreign.srs?' + urllib.parse.urlencode({'key': key})
+
+
+def variant_profile(base, mode, full, inbound, foreign_url=None):
+    require(mode in ('global', 'blacklist', 'whitelist'), 'invalid_mode')
+    if full:
+        require(bool(base.get('endpoints')), 'wireguard_not_configured')
+    p = copy.deepcopy(base)
+    if not full:
+        p.pop('endpoints', None)
+        p['inbounds'] = []
+    p['inbounds'].append(inbound)
+    sets = p['route']['rule_set']
+    if mode != 'global':
+        sets.extend([remote_set('geoip-cn', GEOIP_CN_URL), remote_set('geosite-cn', GEOSITE_CN_URL)])
+    if mode == 'whitelist':
+        sets.append(remote_set('geosite-foreign', GEOSITE_FOREIGN_URL))
+        require(foreign_url, 'foreign_rule_url_required')
+        sets.append(remote_set('geoip-foreign', foreign_url))
+    policy = []
+    if full:
+        policy.append({'ip_cidr': [OVERLAY], 'action': 'route', 'outbound': 'wg-ipv6'})
+    policy.append({'rule_set': ['force-direct'], 'action': 'route', 'outbound': 'direct'})
+    if mode == 'blacklist':
+        policy.append({'rule_set': ['geoip-cn', 'geosite-cn'], 'action': 'route', 'outbound': 'direct'})
+    if mode == 'whitelist':
+        policy.append({'rule_set': ['geoip-cn', 'geosite-cn'], 'action': 'route', 'outbound': 'direct'})
+    if any(item['tag'] == 'singapore' for item in sets):
+        policy.append({'rule_set': ['singapore'], 'action': 'route', 'outbound': 'sg'})
+    if mode == 'whitelist':
+        policy.append({'rule_set': ['geoip-foreign', 'geosite-foreign'], 'action': 'route', 'outbound': 'hk'})
+    p['route']['final'] = 'direct' if mode == 'whitelist' else 'hk'
+    p['route']['rules'] = [{'action': 'sniff', 'sniffer': ['http', 'tls', 'quic', 'dns']}] + copy.deepcopy(policy) + [
+        {'protocol': 'dns', 'action': 'hijack-dns'}, {'action': 'resolve'}] + policy
+    if mode == 'blacklist':
+        p['dns']['rules'].insert(0, {'rule_set': ['geosite-cn'], 'action': 'route', 'server': 'bootstrap'})
+    if mode == 'whitelist':
+        p['dns']['rules'].append({'rule_set': ['geosite-foreign'], 'action': 'route', 'server': 'dns-hk'})
+        p['dns']['final'] = 'bootstrap'
+    return p
+
+
 def build_profile(s, chosen):
     nodes = copy.deepcopy(chosen['hk'] + chosen['sg'])
     outbounds = [{'type': 'direct', 'tag': 'direct', 'domain_resolver': 'bootstrap'}] + nodes
@@ -535,8 +622,11 @@ def build_profile(s, chosen):
     sets = [{'type': 'inline', 'tag': 'force-direct', 'rules': rule_items(s['direct'])}]
     if rule_items(s['singapore']):
         sets.append({'type': 'inline', 'tag': 'singapore', 'rules': rule_items(s['singapore'])})
-    policy = [{'ip_cidr': [OVERLAY], 'action': 'route', 'outbound': 'wg-ipv6'},
-              {'rule_set': ['force-direct'], 'action': 'route', 'outbound': 'direct'}]
+    w = s.get('wireguard')
+    policy = []
+    if w is not None:
+        policy.append({'ip_cidr': [OVERLAY], 'action': 'route', 'outbound': 'wg-ipv6'})
+    policy.append({'rule_set': ['force-direct'], 'action': 'route', 'outbound': 'direct'})
     if rule_items(s['singapore']):
         policy.append({'rule_set': ['singapore'], 'action': 'route', 'outbound': 'sg'})
     dns_rules = []
@@ -544,7 +634,6 @@ def build_profile(s, chosen):
         for key in ('domain', 'domain_suffix'):
             if s[name][key]:
                 dns_rules.append({key: s[name][key], 'action': 'route', 'server': target})
-    w = s['wireguard']
     return {
         'log': {'level': 'warn'},
         'dns': {'servers': [
@@ -552,15 +641,15 @@ def build_profile(s, chosen):
             {'type': 'https', 'tag': 'dns-hk', 'server': '1.1.1.1', 'path': '/dns-query', 'detour': 'hk'},
             {'type': 'https', 'tag': 'dns-sg', 'server': '1.1.1.1', 'path': '/dns-query', 'detour': 'sg'}],
             'rules': dns_rules, 'final': 'dns-hk'},
-        'inbounds': [{'type': 'tun', 'tag': 'tun-in', 'address': ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'],
-                      'auto_route': True, 'strict_route': True, 'stack': 'mixed'}],
-        'endpoints': [{'type': 'wireguard', 'tag': 'wg-ipv6', 'system': False,
+        'inbounds': ([{'type': 'tun', 'tag': 'tun-in', 'address': ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'],
+                      'auto_route': True, 'strict_route': True, 'stack': 'mixed'}] if w is not None else []),
+        'endpoints': ([{'type': 'wireguard', 'tag': 'wg-ipv6', 'system': False,
                        'address': [str(ipaddress.ip_interface(w['address']))],
                        'private_key': w['private_key'], 'mtu': w['mtu'],
                        'domain_resolver': {'server': 'bootstrap', 'strategy': 'ipv6_only'},
                        'peers': [{'address': w['endpoint'], 'port': w['port'],
                                   'public_key': w['peer_public_key'], 'allowed_ips': [OVERLAY],
-                                  'persistent_keepalive_interval': 25}]}],
+                                  'persistent_keepalive_interval': 25}]}] if w is not None else []),
         'outbounds': outbounds,
         'route': {'auto_detect_interface': True, 'default_domain_resolver': 'bootstrap',
                   'rule_set': sets, 'final': 'hk',
@@ -589,6 +678,11 @@ class Publisher:
             require(set(obj['profiles']) == set(devices), 'snapshot_devices_changed')
             for profile in obj['profiles'].values():
                 self.checker(profile)
+                for mode, full in set(CONFIG_PATHS.values()):
+                    if full and not profile.get('endpoints'):
+                        continue
+                    self.checker(variant_profile(profile, mode, full, proxy_options({}),
+                                                 'https://example.invalid/api/rules/geoip-foreign.srs'))
             with self.lock:
                 self.data, self.updated, self.summary = {k: encode(v) for k, v in obj['profiles'].items()}, obj['updated'], obj['summary']
         except Exception:
@@ -616,6 +710,11 @@ class Publisher:
             profiles = {ident: build_profile(settings, chosen) for ident, settings in devices.items()}
             for profile in profiles.values():
                 self.checker(profile)
+                for mode, full in set(CONFIG_PATHS.values()):
+                    if full and not profile.get('endpoints'):
+                        continue
+                    self.checker(variant_profile(profile, mode, full, proxy_options({}),
+                                                 'https://example.invalid/api/rules/geoip-foreign.srs'))
             stage = 'publish'
             updated = int(time.time())
             snapshot = {'fingerprint': hashlib.sha256(encode(s)).hexdigest(), 'profiles': profiles,
@@ -664,9 +763,9 @@ def handler_for(publisher):
             super().setup()
             self.connection.settimeout(10)
 
-        def reply(self, status, data):
+        def reply(self, status, data, content_type='application/json'):
             self.send_response(status)
-            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Type', content_type)
             self.send_header('Cache-Control', 'no-store')
             self.send_header('Content-Length', str(len(data)))
             self.send_header('Connection', 'close')
@@ -678,13 +777,14 @@ def handler_for(publisher):
             if u.path == '/healthz':
                 self.reply(200, encode(publisher.status()))
                 return
-            if u.path != '/api/config':
+            is_rule = u.path == '/api/rules/geoip-foreign.srs'
+            if u.path not in CONFIG_PATHS and not is_rule:
                 self.reply(404, b'{"error":"not_found"}')
                 return
             try:
                 # Auth always uses the current settings, not a cached/old key.
                 settings = load_settings(publisher.settings)
-                query = urllib.parse.parse_qs(u.query, strict_parsing=True)
+                query = urllib.parse.parse_qs(u.query, strict_parsing=True, keep_blank_values=True)
                 header = self.headers.get('Authorization', '')
                 supplied = header[7:] if header.startswith('Bearer ') else query.get('key', [''])[0]
                 ident = next((d['id'] for d in settings['devices']
@@ -694,9 +794,33 @@ def handler_for(publisher):
             if ident is None:
                 self.reply(401, b'{"error":"unauthorized"}')
                 return
+            if is_rule:
+                if set(query) != {'key'} or len(query['key']) != 1:
+                    self.reply(400, b'{"error":"invalid_query_parameter"}')
+                    return
+                self.reply(200, FOREIGN_RULE_PATH.read_bytes(), 'application/octet-stream')
+                return
+            try:
+                inbound = proxy_options(query)
+            except Invalid as exc:
+                self.reply(400, encode({'error': str(exc)}))
+                return
             with publisher.lock:
                 data = publisher.data.get(ident) if publisher.data else None
-            self.reply(200 if data else 503, data or b'{"error":"not_ready"}')
+            if data is None:
+                self.reply(503, b'{"error":"not_ready"}')
+                return
+            mode, full = CONFIG_PATHS[u.path]
+            base = json.loads(data)
+            if full and not base.get('endpoints'):
+                self.reply(409, b'{"error":"wireguard_not_configured"}')
+                return
+            try:
+                rule_url = foreign_rule_url(self.headers.get('Host'), supplied) if mode == 'whitelist' else None
+            except Invalid as exc:
+                self.reply(400, encode({'error': str(exc)}))
+                return
+            self.reply(200, encode(variant_profile(base, mode, full, inbound, rule_url)))
 
         def do_POST(self):
             self.reply(405, b'{"error":"method_not_allowed"}')

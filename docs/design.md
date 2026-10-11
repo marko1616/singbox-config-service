@@ -32,7 +32,7 @@ The old marko-network worktree and its uncommitted edits are untouched.
    Probe it only when HK subscription nodes are empty after probing (including no HK entries); then it becomes default only if healthy.
    Singapore has no backup, so an empty or fully failing SG group refuses publication.
    Private manual_nodes are merged with subscription nodes before classification and probing.
-5. Build one client profile per device from the same selected nodes, with its own WireGuard identity; check every profile with real sing-box, then atomically persist the entire batch.
+5. Build one client profile per device from the same selected nodes. WireGuard identity is optional; a device without it serves only proxyonly variants. Check available variants with real sing-box, then atomically persist the entire batch.
 6. GET authenticates each device key against current settings and serves only its matching checked profile. Refresh failures keep the previous batch, expose only static errors, and retry.
 
 On restart the snapshot is used only when the rendered settings fingerprint and device IDs match and all profiles pass the core checker.

@@ -6,37 +6,39 @@
 ## 多设备私有配置
 
 `private-config/settings.json` 顶层恰好包含 `devices`（1–64 个设备的列表）和 `shared`（服务器共有设置对象）。
-每个设备必须有唯一 `id`、`api_key` 和完整 `wireguard`；WireGuard 客户端地址、私钥也不能复用。
+每个设备必须有唯一 `id`、`api_key`；`wireguard` 可省略或设为 `null`。未配置 WireGuard 的设备
+只能使用三个 `proxyonly` 接口；要启用 `full`，添加完整的 `wireguard` 对象，且客户端地址、私钥不能与其他设备复用。
 订阅地址、测速参数、规则、手动节点和自有 hy2 放在 `shared`，只拉取、转换和测速一次。
 所有设备配置都经 sing-box 校验后，才作为一份快照原子发布；一台设备失败就保留整组旧快照。
-原有 `/api/config?key=<API_KEY>` URL 不变，key 自动识别设备并只返回该设备的配置。
-`/healthz` 仍只显示整体状态，不列设备或密钥。添加设备前，先在 WireGuard 服务端分配独立 peer。
+所有六个配置 URL 沿用该设备现有 API key；key 自动识别设备并只返回该设备的配置。
+旧 `/api/config` 不再提供，原订阅 URL 需改为 `/api/config-global-full` 等新路径。
+`/healthz` 仍只显示整体状态，不列设备或密钥。仅在为设备启用 WireGuard 前，才需在服务端分配独立 peer。
 
 从旧版扁平 `private-config/settings.json` 转换：在仓库根目录执行以下一次性命令。
 它验证旧格式，保留 `settings.json.bak`（已有备份时拒绝覆盖），再以原权限原子写入新格式；不会自动部署。
 
 ```sh
-python3 -c 'import json,os,shutil,tempfile; from pathlib import Path; from service import validate,device_settings,encode; p=Path("private-config/settings.json"); s=json.loads(p.read_bytes()); validate(s); b=p.with_name(p.name+".bak"); assert not b.exists(), "backup already exists"; d={"id":"phone","api_key":s.pop("api_key"),"wireguard":s.pop("wireguard")}; new={"devices":[d],"shared":s}; device_settings(new); shutil.copy2(p,b); fd,tmp=tempfile.mkstemp(dir=p.parent,prefix=".settings-"); os.fchmod(fd,p.stat().st_mode & 0o777); f=os.fdopen(fd,"wb"); f.write(encode(new)); f.flush(); os.fsync(f.fileno()); f.close(); os.replace(tmp,p); print("converted:",p,"backup:",b)'
+python3 -c 'import json,os,shutil,tempfile; from pathlib import Path; from service import validate,device_settings,encode; p=Path("private-config/settings.json"); s=json.loads(p.read_bytes()); validate(s); b=p.with_name(p.name+".bak"); assert not b.exists(), "backup already exists"; d={"id":"phone","api_key":s.pop("api_key")}; w=s.pop("wireguard",None); d.update({"wireguard":w} if w is not None else {}); new={"devices":[d],"shared":s}; device_settings(new); shutil.copy2(p,b); fd,tmp=tempfile.mkstemp(dir=p.parent,prefix=".settings-"); os.fchmod(fd,p.stat().st_mode & 0o777); f=os.fdopen(fd,"wb"); f.write(encode(new)); f.flush(); os.fsync(f.fileno()); f.close(); os.replace(tmp,p); print("converted:",p,"backup:",b)'
 ```
 
 转换后用编辑器改 `id`、追加其他设备及其独立凭据，再执行 `python3 cli.py render`，最后按原部署流程重启容器。
 首次多设备部署会使旧单设备快照的格式失效；新服务成功刷新前返回 503，建议保留客户端原有可用配置。
 
-## 固定合同
+## global 模式固定合同
 
 | 顺序 | 目标 | 出站 |
 |---|---|---|
-| 1 | 10.77.0.0/24 | WireGuard；外层仅公网 IPv6/AAAA，没有 IPv4 或代理备用 |
+| 1 | 10.77.0.0/24（仅启用 WireGuard 的 full） | WireGuard；外层仅公网 IPv6/AAAA，没有 IPv4 或代理备用 |
 | 2 | 自定义强制 DIRECT 集 | DIRECT，覆盖新加坡白名单 |
 | 3 | 新加坡白名单：目标 IP/CIDR、精确域名、域名后缀 | 新加坡 |
 | 4 | 其他 | 香港 |
 
 DIRECT 初始收录 35 个中国公共 DNS IP、5 个域名后缀；见 `data/direct.json` 和 `docs/rule-source.md`。
-没有 geoip:cn/geosite:cn，没有推测补入公共上报 API。`360.cn` 按确认保留，含其所有子域名。
+`global` 模式仍没有 GeoIP/Geosite 规则。`360.cn` 按确认保留，含其所有子域名。
 `domain` 表示精确域名，`domain_suffix` 表示域名及子域名；不写 `domain:`、`*.` 或 URL。
 IP 和域名条件是 **OR**，不是 AND。域名未提前命中时，解析后再次按内网 → DIRECT → SG 检查目标 IP。
 
-DNS 处理：发往 DIRECT 列表的 DNS 流量直接发出；其他识别到的普通 DNS 交给 sing-box DNS。
+下述 DNS 处理仅描述 global 模式：发往 DIRECT 列表的 DNS 流量直接发出；其他识别到的普通 DNS 交给 sing-box DNS。
 DIRECT 域名走设备系统/底层 DNS，SG 白名单域名的 DoH 经 SG，其他 DoH 经 HK（Cloudflare 1.1.1.1）。
 节点域名与 WG endpoint 用本地 DNS 引导，WG endpoint 明确 `ipv6_only`；这不是“所有 DNS 查询直连”。
 IP 白名单要等解析后才知道是否命中，因此未匹配域名白名单的 DNS 查询仍按默认 HK 解析。
@@ -69,7 +71,7 @@ Show service status / Exit。
 同一批动作也可直接调用：`init`、`render`、`build`、`up`、`down`、`logs`、`status`，仅用标准库。
 
 1. 选择 Initialize，生成 `private-config/settings.json`。已有文件绝不覆盖。
-2. 用 Neovim 或其他编辑器填写占位符：`shared` 中的订阅 URL、自有 hy2，以及 `devices` 中每台设备的 API key、WG 客户端地址（/32）及密钥、WG endpoint。
+2. 用 Neovim 或其他编辑器填写占位符：`shared` 中的订阅 URL、自有 hy2，以及 `devices` 中每台设备的 API key。初始模板没有 WireGuard，默认只能使用 `proxyonly`。需要 `full` 的设备再添加完整 `wireguard` 对象，填写客户端地址（/32）、密钥和 endpoint。
 3. `api_key` 必须为 **32–128 个 URL-safe 字符**：`A-Z a-z 0-9 _ -`。因为该 key 会出现在订阅 URL 的查询串里，
    `+ / = !` 等字符被拒绝（基密码管理器生成、带 `=+/` 的 base64 串会直接报 `api_key_format`）。
 4. 填写 `singapore` 白名单。`direct` 可加个人强制直连条目，与内置列表合并。
@@ -106,12 +108,29 @@ Show service status / Exit。
 代理分三层：Docker daemon 拉基础镜像、构建期下载、运行期拉订阅。Compose 传入标准大小写 HTTP_PROXY/HTTPS_PROXY；daemon 的代理需由现有 Docker 环境提供。
 配置 API 的容器内健康检查不走环境代理。`NO_PROXY` 不会绕过节点测速。
 
-## 唯一业务接口
+## 配置接口
 
 - 方法：**GET**
-- URL：`https://<你的配置域名>/api/config?key=<该设备的 API_KEY>`，适用于只接受订阅 URL 的客户端。
+- URL：`https://<你的配置域名>/api/config-<模式>-<形态>?key=<该设备的 API_KEY>`。
+- 模式：`global`（现有强制直连 → SG 白名单 → 其余 HK）、`blacklist`（再把中国 GeoIP/Geosite 直连，其他 HK）、
+  `whitelist`（明确的国外 GeoIP/Geosite 才经 HK；中国及未知归属直连）。SG 白名单仍优先于国外规则，
+  强制直连始终优先于 SG。`whitelist` 的国外 IP 来自 [SagerNet/sing-geoip](https://github.com/SagerNet/sing-geoip)
+  常用的 20 个非 `cn` 国家/地区规则集合并，不以“不是中国 IP”代替“有明确国外归属”：
+  US、GB、CA、AU、NZ、DE、FR、NL、CH、SE、NO、FI、JP、KR、SG、HK、TW、IN、IE、IL。
+  合并源为其 `rule-set` 分支提交 `7fe82a879ad2666526730c195b55a6d8d9147908`，
+  二进制文件 SHA-256 为 `717c07df3f02ec9ce215e14c3554fa20d27c82e93fa510f36c7071e56444d1e6`。
+- 形态：`full` 保留 TUN 和 WireGuard；`proxyonly` 只提供混合代理入站，没有 TUN/WireGuard，适合服务器和过渡使用。未配置 WireGuard 的设备请求任一 `full` 接口返回 409 `wireguard_not_configured`；同一设备的三个 `proxyonly` 接口仍可正常下发。
+- 六个路径：`/api/config-global-full`、`/api/config-blacklist-full`、`/api/config-whitelist-full`、
+  `/api/config-global-proxyonly`、`/api/config-blacklist-proxyonly`、`/api/config-whitelist-proxyonly`。
+- 每份配置都追加 `mixed` 入站（同端口提供 SOCKS4/4a/5 与 HTTP），默认 `127.0.0.1:10808`、无认证。
+  可传 `port=20808&listen=127.0.0.1&user=alice&password=<密码>`；`user` 和 `password` 必须同时提供，
+  不允许只传一项。`listen=0.0.0.0` 等非 loopback 地址会把代理暴露到该设备可达的网络，只有你主动传入才启用。
+- `whitelist` 的 GeoIP 国外合并规则从相同配置域名的 `/api/rules/geoip-foreign.srs` 下载，
+  URL 自动带同一个设备 key，由 HK 出站获取；反向代理须转发该路径并保留原始 Host。
+  规则文件与服务代码同版本交付，不依赖客户端再从 GitHub 下载国外 GeoIP 数据。
+- 旧 `/api/config` 返回 404，不作兼容别名。
 - 也支持 `Authorization: Bearer <API_KEY>`，此时 URL 不需要 key 参数。
-- 成功 200：完整 sing-box JSON；密钥错误 401；尚无有效配置 503；POST 405。
+- 成功 200：完整 sing-box JSON；无效参数 400；密钥错误 401；缺少 WireGuard 的 `full` 请求 409；尚无有效配置 503；POST 405。
 - `/healthz` 仅返回 ready/stale、刷新阶段、静态错误码、数量、是否启用 hy2，不输出节点、密钥或订阅地址。
 - 健康检查检查 `ready`，不是仅看 HTTP 200。已有旧配置时 ready=true、刷新失败 stale=true。
 - 诊断只走 stdout：菜单的 Follow service logs（`cli.py logs-follow`）持续显示每轮结果，
@@ -131,7 +150,7 @@ DEBUG 逐个记录候选所属地区、标准化 tag、节点地址/端口/协�
 仅改变日志等级无需重新 render 或 build，但要再次 Start service 让 Compose 按新环境重建容器；
 未设置时恢复 INFO。无效等级会被本地 CLI 拒绝。
 
-没有上传配置接口、远程修改接口、模式枚举或管理 WebUI。服务日志不记录请求 URL。
+没有上传配置接口、远程修改接口或管理 WebUI。服务日志不记录请求 URL。
 更换 API key 后旧 key 立即不再有效；策略改动在下一次成功刷新后发布。
 
 ## 回退与验收

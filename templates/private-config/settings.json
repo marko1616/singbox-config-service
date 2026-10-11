@@ -2,15 +2,7 @@
   "devices": [
     {
       "id": "phone",
-      "api_key": "<REPLACE_WITH_RANDOM_KEY_AT_LEAST_32_CHARACTERS>",
-      "wireguard": {
-        "address": "<CLIENT_OVERLAY_IPV4_CIDR>",
-        "private_key": "<CLIENT_PRIVATE_KEY>",
-        "peer_public_key": "<SERVER_PUBLIC_KEY>",
-        "endpoint": "<SERVER_DDNS_HOST_OR_PUBLIC_IPV6>",
-        "port": 51820,
-        "mtu": 1280
-      }
+      "api_key": "<REPLACE_WITH_RANDOM_KEY_AT_LEAST_32_CHARACTERS>"
     }
   ],
   "shared": {

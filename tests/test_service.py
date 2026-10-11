@@ -23,7 +23,8 @@ def settings():
     root = json.loads((ROOT / 'templates/private-config/settings.json').read_bytes())
     s = root['shared']
     s.update(api_key='test_' + 'x' * 40, subscription_url='https://subscription.example.invalid/feed')
-    s['wireguard'] = root['devices'][0]['wireguard']
+    s['wireguard'] = {'address': '10.77.0.2/32', 'private_key': '', 'peer_public_key': '',
+                      'endpoint': 'wg.example.invalid', 'port': 51820, 'mtu': 1280}
     s['wireguard'].update(address='10.77.0.2/32', private_key=base64.b64encode(bytes(range(32))).decode(),
                           peer_public_key=base64.b64encode(bytes(range(1, 33))).decode(), endpoint='wg.example.invalid')
     s['own_hy2'].update(server='hk.example.invalid', password='synthetic-password',
@@ -36,7 +37,10 @@ def settings():
 
 def root_settings(s=None):
     s = copy.deepcopy(s if s is not None else settings())
-    return {'devices': [{'id': 'phone', 'api_key': s.pop('api_key'), 'wireguard': s.pop('wireguard')}],
+    device = {'id': 'phone', 'api_key': s.pop('api_key')}
+    if 'wireguard' in s:
+        device['wireguard'] = s.pop('wireguard')
+    return {'devices': [device],
             'shared': s}
 
 
@@ -184,6 +188,53 @@ class SelectionTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_missing_wireguard_allows_only_proxyonly(self):
+        s = settings()
+        s.pop('wireguard')
+        m.validate(s)
+        root = root_settings(s)
+        effective = m.device_settings(root)['phone']
+        self.assertIsNone(effective['wireguard'])
+        chosen, _ = m.select(nodes(), effective, lambda n, s: 1, no_check)
+        base = m.build_profile(effective, chosen)
+        self.assertEqual(base['inbounds'], [])
+        self.assertEqual(base['endpoints'], [])
+        for mode in ('global', 'blacklist', 'whitelist'):
+            profile = m.variant_profile(base, mode, False, m.proxy_options({}),
+                                        'https://example.invalid/foreign.srs')
+            self.assertEqual([x['type'] for x in profile['inbounds']], ['mixed'])
+            self.assertNotIn('endpoints', profile)
+            m.check_profile(profile)
+            with self.assertRaisesRegex(m.Invalid, 'wireguard_not_configured'):
+                m.variant_profile(base, mode, True, m.proxy_options({}),
+                                  'https://example.invalid/foreign.srs')
+
+    def test_six_variants_and_proxy_arguments(self):
+        s = settings()
+        chosen, _ = m.select(nodes(), s, lambda n, s: 1, no_check)
+        base = m.build_profile(s, chosen)
+        self.assertEqual(len(m.CONFIG_PATHS), 6)
+        for mode in ('global', 'blacklist', 'whitelist'):
+            for full in (True, False):
+                p = m.variant_profile(base, mode, full, m.proxy_options({}),
+                                      'https://example.invalid/foreign.srs')
+                self.assertEqual(any(x['type'] == 'tun' for x in p['inbounds']), full)
+                self.assertEqual('endpoints' in p, full)
+                self.assertEqual(p['inbounds'][-1]['type'], 'mixed')
+                self.assertEqual(p['inbounds'][-1]['listen'], '127.0.0.1')
+                self.assertEqual(p['inbounds'][-1]['listen_port'], 10808)
+                self.assertEqual(p['route']['final'], 'direct' if mode == 'whitelist' else 'hk')
+                tags = {x['tag'] for x in p['route']['rule_set']}
+                self.assertEqual('geoip-cn' in tags, mode != 'global')
+                self.assertEqual('geoip-foreign' in tags, mode == 'whitelist')
+                m.check_profile(p)
+        inbound = m.proxy_options({'port': ['20808'], 'listen': ['::1'],
+                                   'user': ['alice'], 'password': ['secret']})
+        self.assertEqual(inbound['users'], [{'username': 'alice', 'password': 'secret'}])
+        for query in ({'port': ['0']}, {'port': ['65536']}, {'listen': ['example.com']},
+                      {'user': ['alice']}, {'port': ['10808', '10809']}):
+            with self.assertRaises(m.Invalid): m.proxy_options(query)
+
     def test_multidevice_identity_uniqueness_and_shape(self):
         root = add_second_device(root_settings())
         self.assertEqual(set(m.device_settings(root)), {'phone', 'tablet'})
@@ -194,6 +245,10 @@ class ConfigTests(unittest.TestCase):
         bad = copy.deepcopy(root)
         bad['devices'][1]['wireguard']['address'] = '10.77.0.2'
         with self.assertRaisesRegex(m.Invalid, 'duplicate_wireguard_address'): m.device_settings(bad)
+        root['devices'].append({'id': 'server', 'api_key': 'server_' + 'z' * 40})
+        self.assertIsNone(m.device_settings(root)['server']['wireguard'])
+        root['devices'][-1]['wireguard'] = None
+        self.assertIsNone(m.device_settings(root)['server']['wireguard'])
 
     def test_validate_rejects_placeholders_ipv4_endpoint_bad_key(self):
         with self.assertRaises(m.Invalid):
@@ -300,6 +355,33 @@ class PublisherTests(unittest.TestCase):
         changed = m.Publisher(self.settings, self.p.snapshot); changed.restore()
         self.assertIsNone(changed.data)
 
+    def test_wireguard_and_proxyonly_devices_publish_together(self):
+        self.s['devices'].append({'id': 'server', 'api_key': 'server_' + 'z' * 40})
+        m.atomic_write(self.settings, m.encode(self.s))
+        self.assertTrue(self.p.refresh(), self.p.status())
+        self.assertEqual(json.loads(self.p.data['server'])['endpoints'], [])
+        restored = m.Publisher(self.settings, self.p.snapshot)
+        restored.restore()
+        self.assertEqual(restored.data, self.p.data)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), m.handler_for(self.p))
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        def request(path, key):
+            req = urllib.request.Request(f'http://127.0.0.1:{server.server_port}{path}',
+                                         headers={'Authorization': 'Bearer ' + key})
+            try: response = opener.open(req, timeout=2)
+            except urllib.error.HTTPError as exc: response = exc
+            with response: return response.status, json.loads(response.read())
+        for mode in ('global', 'blacklist', 'whitelist'):
+            prefix = '/api/config-' + mode
+            status, body = request(prefix + '-proxyonly', self.s['devices'][1]['api_key'])
+            self.assertEqual(status, 200)
+            self.assertEqual([x['type'] for x in body['inbounds']], ['mixed'])
+            status, body = request(prefix + '-full', self.s['devices'][1]['api_key'])
+            self.assertEqual((status, body), (409, {'error': 'wireguard_not_configured'}))
+            self.assertEqual(request(prefix + '-full', self.s['devices'][0]['api_key'])[0], 200)
+
     def test_one_device_check_failure_preserves_previous_batch(self):
         self.assertTrue(self.p.refresh())
         old = self.p.data
@@ -340,18 +422,37 @@ class PublisherTests(unittest.TestCase):
             try: response = opener.open(req, timeout=2)
             except urllib.error.HTTPError as e: response = e
             with response: return response.status, response.read()
-        self.assertEqual(request('/api/config')[0], 401)
-        self.assertEqual(request('/api/config', self.s['devices'][0]['api_key'])[0], 503)
+        self.assertEqual(request('/api/config')[0], 404)
+        self.assertEqual(request('/api/config-global-full')[0], 401)
+        self.assertEqual(request('/api/config-global-full', self.s['devices'][0]['api_key'])[0], 503)
         self.assertEqual(json.loads(request('/healthz')[1])['ready'], False)
         self.assertTrue(self.p.refresh())
-        for url, key in [('/api/config', self.s['devices'][0]['api_key']), ('/api/config?key=' + self.s['devices'][0]['api_key'], None)]:
+        for url, key in [('/api/config-global-full', self.s['devices'][0]['api_key']),
+                         ('/api/config-global-full?key=' + self.s['devices'][0]['api_key'], None)]:
             status, data = request(url, key)
-            self.assertEqual(status, 200); self.assertEqual(data, self.p.data['phone'])
-        self.assertEqual(request('/api/config', self.s['devices'][0]['api_key'], 'POST')[0], 405)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(data)['inbounds'][-1]['listen_port'], 10808)
+        for path in m.CONFIG_PATHS:
+            status, data = request(path, self.s['devices'][0]['api_key'])
+            self.assertEqual(status, 200, path)
+            self.assertEqual(json.loads(data)['inbounds'][-1]['type'], 'mixed')
+        status, data = request('/api/config-whitelist-proxyonly?port=20808&listen=0.0.0.0&user=alice&password=secret',
+                               self.s['devices'][0]['api_key'])
+        self.assertEqual(status, 200)
+        profile = json.loads(data)
+        self.assertEqual(profile['inbounds'], [{'type': 'mixed', 'tag': 'mixed-in', 'listen': '0.0.0.0',
+                                                'listen_port': 20808,
+                                                'users': [{'username': 'alice', 'password': 'secret'}]}])
+        rule_url = next(x['url'] for x in profile['route']['rule_set'] if x['tag'] == 'geoip-foreign')
+        self.assertIn(self.s['devices'][0]['api_key'], rule_url)
+        self.assertEqual(request('/api/rules/geoip-foreign.srs?key=' + self.s['devices'][0]['api_key'])[1],
+                         m.FOREIGN_RULE_PATH.read_bytes())
+        self.assertEqual(request('/api/config-global-full?port=0', self.s['devices'][0]['api_key'])[0], 400)
+        self.assertEqual(request('/api/config-global-full', self.s['devices'][0]['api_key'], 'POST')[0], 405)
         old = self.s['devices'][0]['api_key']; self.s['devices'][0]['api_key'] = 'new_' + 'y' * 40
         m.atomic_write(self.settings, m.encode(self.s))
-        self.assertEqual(request('/api/config', old)[0], 401)
-        self.assertEqual(request('/api/config', self.s['devices'][0]['api_key'])[0], 200)
+        self.assertEqual(request('/api/config-global-full', old)[0], 401)
+        self.assertEqual(request('/api/config-global-full', self.s['devices'][0]['api_key'])[0], 200)
 
     def test_http_keys_are_device_scoped(self):
         self.s = add_second_device(self.s)
@@ -362,13 +463,31 @@ class PublisherTests(unittest.TestCase):
         self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         for ident, device in [('phone', self.s['devices'][0]), ('tablet', self.s['devices'][1])]:
-            req = urllib.request.Request(f'http://127.0.0.1:{server.server_port}/api/config?key={device["api_key"]}')
+            req = urllib.request.Request(f'http://127.0.0.1:{server.server_port}/api/config-global-full?key={device["api_key"]}')
             with opener.open(req, timeout=2) as response:
-                self.assertEqual(response.read(), self.p.data[ident])
+                self.assertEqual(json.loads(response.read())['endpoints'][0]['address'],
+                                 json.loads(self.p.data[ident])['endpoints'][0]['address'])
         self.assertNotEqual(self.p.data['phone'], self.p.data['tablet'])
 
 
 class RenderTests(unittest.TestCase):
+    def test_template_defaults_to_proxyonly_without_wireguard(self):
+        template = json.loads((ROOT / 'templates/private-config/settings.json').read_bytes())
+        self.assertNotIn('wireguard', template['devices'][0])
+        with tempfile.TemporaryDirectory() as tmp:
+            r = Path(tmp)
+            shutil.copytree(ROOT / 'templates', r / 'templates')
+            shutil.copytree(ROOT / 'data', r / 'data')
+            target = cli.initialize(r)
+            s = root_settings(settings())
+            s['devices'][0].pop('wireguard')
+            m.atomic_write(target, m.encode(s))
+            out = cli.render(r)
+            self.assertIsNone(m.device_settings(m.load_settings(out))['phone']['wireguard'])
+            publisher = m.Publisher(out, r / 'state/snapshot.json', fetcher=lambda s: b'x',
+                                    converter=lambda b: nodes(), measure=lambda n, s: 1)
+            self.assertTrue(publisher.refresh(), publisher.status())
+
     def test_real_mount_shape_and_permissions(self):
         with tempfile.TemporaryDirectory() as tmp:
             r = Path(tmp)
