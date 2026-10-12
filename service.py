@@ -165,7 +165,10 @@ def validate(s):
 
 def device_settings(root):
     """Validate the two-level document and return effective settings by device id."""
-    require(isinstance(root, dict) and set(root) == {'devices', 'shared'}, 'settings_fields')
+    require(isinstance(root, dict) and {'devices', 'shared'} <= set(root) <=
+            {'devices', 'shared', 'public_base_url'}, 'settings_fields')
+    if 'public_base_url' in root:
+        validate_public_base_url(root['public_base_url'])
     require(isinstance(root['devices'], list) and 1 <= len(root['devices']) <= 64, 'devices_list')
     require(isinstance(root['shared'], dict), 'shared_settings')
     expected = {'subscription_url', 'subscription_user_agent', 'top_k', 'refresh_seconds',
@@ -567,8 +570,26 @@ def remote_set(tag, url):
             'http_client': {'detour': 'hk'}, 'update_interval': '7d'}
 
 
-def foreign_rule_url(host, key):
-    """Use the subscription host for the authenticated companion rule-set."""
+def validate_public_base_url(url):
+    require(isinstance(url, str) and len(url) <= 512 and not any(c in url for c in '\\ ?#\r\n\t'),
+            'invalid_public_base_url')
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        require(parsed.scheme == 'https' and parsed.hostname and parsed.port != 0 and
+                parsed.username is None and parsed.password is None and
+                not parsed.query and not parsed.fragment and
+                re.fullmatch(r'(?:/[A-Za-z0-9._~-]+)*/?', parsed.path) and
+                all(segment not in ('.', '..') for segment in parsed.path.split('/')),
+                'invalid_public_base_url')
+    except ValueError:
+        raise Invalid('invalid_public_base_url') from None
+    return url.rstrip('/')
+
+
+def foreign_rule_url(host, key, public_base_url=None):
+    """Use the configured public base, falling back to the subscription host."""
+    if public_base_url is not None:
+        return validate_public_base_url(public_base_url) + '/api/rules/geoip-foreign.srs?' + urllib.parse.urlencode({'key': key})
     require(isinstance(host, str) and len(host) <= 253 and
             not any(c in host for c in '/?#@\\\r\n\t '), 'invalid_request_host')
     try:
@@ -823,7 +844,8 @@ def handler_for(publisher):
                 self.reply(409, b'{"error":"wireguard_not_configured"}')
                 return
             try:
-                rule_url = foreign_rule_url(self.headers.get('Host'), supplied) if mode == 'whitelist' else None
+                rule_url = foreign_rule_url(self.headers.get('Host'), supplied,
+                                            settings.get('public_base_url')) if mode == 'whitelist' else None
             except Invalid as exc:
                 self.reply(400, encode({'error': str(exc)}))
                 return

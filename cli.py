@@ -31,6 +31,7 @@ ERROR_HELP = {
     "api_key_format": "api_key must be 32-128 URL-safe characters: A-Z a-z 0-9 _ -",
     "settings_owner_permissions": "private-config/settings.json must be owned by you, mode 0600",
     "settings_fields": "settings.json has missing or unexpected top-level keys",
+    "invalid_public_base_url": "public_base_url must be an HTTPS origin with an optional plain path prefix, and no query or fragment",
     "devices_list": "devices must contain 1-64 device objects",
     "device_fields": "each device needs id and api_key; wireguard is optional",
     "wireguard_not_configured": "this device has no WireGuard; use a proxyonly config URL",

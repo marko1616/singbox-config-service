@@ -130,8 +130,12 @@ Show service status / Exit。
 - 每份配置都追加 `mixed` 入站（同端口提供 SOCKS4/4a/5 与 HTTP），默认 `127.0.0.1:10808`、无认证。
   可传 `port=20808&listen=127.0.0.1&user=alice&password=<密码>`；`user` 和 `password` 必须同时提供，
   不允许只传一项。`listen=0.0.0.0` 等非 loopback 地址会把代理暴露到该设备可达的网络，只有你主动传入才启用。
-- `whitelist` 的 GeoIP 国外合并规则从相同配置域名的 `/api/rules/geoip-foreign.srs` 下载，
-  URL 自动带同一个设备 key，由 HK 出站获取；反向代理须转发该路径并保留原始 Host。
+- `whitelist` 的 GeoIP 国外合并规则从 `private-config/settings.json` 顶层 `public_base_url`
+  加 `/api/rules/geoip-foreign.srs` 下载，URL 自动带同一个设备 key，由 HK 出站获取。
+  `public_base_url` 填客户端实际访问的 HTTPS 入口（可带反代路径前缀，例如
+  `https://example.com/sfa/`）；反代须把该入口下的规则路径转发到服务内部
+  `/api/rules/geoip-foreign.srs`。已有配置不加此字段时继续使用原来的 Host 根路径行为，
+  因此带前缀部署必须自行在已有私有设置中补上该字段，再通过菜单 render、build、up。
   规则文件与服务代码同版本交付，不依赖客户端再从 GitHub 下载国外 GeoIP 数据。
 - 旧 `/api/config` 返回 404，不作兼容别名。
 - 也支持 `Authorization: Bearer <API_KEY>`，此时 URL 不需要 key 参数。

@@ -188,6 +188,21 @@ class SelectionTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_public_base_url_with_proxy_prefix(self):
+        root = root_settings()
+        root['public_base_url'] = 'https://example.invalid/sfa/'
+        m.device_settings(root)
+        self.assertEqual(m.foreign_rule_url('internal.invalid:8787', 'test_key', root['public_base_url']),
+                         'https://example.invalid/sfa/api/rules/geoip-foreign.srs?key=test_key')
+        self.assertEqual(m.foreign_rule_url('example.invalid', 'test_key'),
+                         'https://example.invalid/api/rules/geoip-foreign.srs?key=test_key')
+        for url in ('http://example.invalid/sfa/', 'https://example.invalid/sfa/?x=1',
+                    'https://example.invalid/sfa/../x', 'https://example.invalid:99999/sfa/',
+                    'https://user@example.invalid/sfa/'):
+            root['public_base_url'] = url
+            with self.assertRaisesRegex(m.Invalid, '^invalid_public_base_url$'):
+                m.device_settings(root)
+
     def test_domain_regex_routes_dns_and_accepts_legacy_rule_shape(self):
         s = settings()
         direct_regex = r'^direct[0-9]+\.example\.invalid$'
@@ -445,6 +460,8 @@ class PublisherTests(unittest.TestCase):
         self.assertIsNone(q.data)
 
     def test_http_auth_get_post_not_ready_and_key_rotation(self):
+        self.s['public_base_url'] = 'https://example.invalid/sfa/'
+        m.atomic_write(self.settings, m.encode(self.s))
         server = ThreadingHTTPServer(('127.0.0.1', 0), m.handler_for(self.p))
         t = threading.Thread(target=server.serve_forever, daemon=True); t.start()
         self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
@@ -477,7 +494,8 @@ class PublisherTests(unittest.TestCase):
                                                 'listen_port': 20808,
                                                 'users': [{'username': 'alice', 'password': 'secret'}]}])
         rule_url = next(x['url'] for x in profile['route']['rule_set'] if x['tag'] == 'geoip-foreign')
-        self.assertIn(self.s['devices'][0]['api_key'], rule_url)
+        self.assertEqual(rule_url, 'https://example.invalid/sfa/api/rules/geoip-foreign.srs?key=' +
+                         self.s['devices'][0]['api_key'])
         self.assertEqual(request('/api/rules/geoip-foreign.srs?key=' + self.s['devices'][0]['api_key'])[1],
                          m.FOREIGN_RULE_PATH.read_bytes())
         self.assertEqual(request('/api/config-global-full?port=0', self.s['devices'][0]['api_key'])[0], 400)
