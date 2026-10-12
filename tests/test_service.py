@@ -188,6 +188,35 @@ class SelectionTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_domain_regex_routes_dns_and_accepts_legacy_rule_shape(self):
+        s = settings()
+        direct_regex = r'^direct[0-9]+\.example\.invalid$'
+        sg_regex = r'^sg[0-9]+\.example\.invalid$'
+        s['direct']['domain_regex'] = [direct_regex]
+        s['singapore']['domain_regex'] = [sg_regex]
+        m.validate(s)
+        chosen, _ = m.select(nodes(), s, lambda n, s: 1, no_check)
+        profile = m.build_profile(s, chosen)
+        sets = {item['tag']: item['rules'] for item in profile['route']['rule_set']
+                if item['type'] == 'inline'}
+        self.assertIn({'domain_regex': [direct_regex]}, sets['force-direct'])
+        self.assertIn({'domain_regex': [sg_regex]}, sets['singapore'])
+        self.assertIn({'domain_regex': [direct_regex], 'action': 'route', 'server': 'bootstrap'},
+                      profile['dns']['rules'])
+        self.assertIn({'domain_regex': [sg_regex], 'action': 'route', 'server': 'dns-sg'},
+                      profile['dns']['rules'])
+        m.check_profile(profile)
+        s['direct'].pop('domain_regex')
+        s['singapore'].pop('domain_regex')
+        m.validate(s)
+
+    def test_domain_regex_invalid_fails_with_static_error(self):
+        for value in ('[', '', 42, 'a' * 1025):
+            s = settings()
+            s['direct']['domain_regex'] = [value]
+            with self.assertRaisesRegex(m.Invalid, '^invalid_domain_regex$'):
+                m.validate(s)
+
     def test_missing_wireguard_allows_only_proxyonly(self):
         s = settings()
         s.pop('wireguard')
@@ -227,6 +256,10 @@ class ConfigTests(unittest.TestCase):
                 tags = {x['tag'] for x in p['route']['rule_set']}
                 self.assertEqual('geoip-cn' in tags, mode != 'global')
                 self.assertEqual('geoip-foreign' in tags, mode == 'whitelist')
+                for rule_set in p['route']['rule_set']:
+                    if rule_set['type'] == 'remote':
+                        self.assertEqual(rule_set['http_client'], {'detour': 'hk'})
+                        self.assertNotIn('download_detour', rule_set)
                 m.check_profile(p)
         inbound = m.proxy_options({'port': ['20808'], 'listen': ['::1'],
                                    'user': ['alice'], 'password': ['secret']})

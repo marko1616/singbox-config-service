@@ -112,7 +112,8 @@ class LocalNetworkTests(unittest.TestCase):
         s = settings()
         s['direct'] = {'ip_cidr': ['127.0.0.1/32'], 'domain': ['direct.example.invalid'], 'domain_suffix': []}
         s['singapore'] = {'ip_cidr': ['127.0.0.1/32', '127.0.0.2/32'],
-                         'domain': ['sg.example.invalid'], 'domain_suffix': []}
+                         'domain': ['sg.example.invalid'], 'domain_suffix': [],
+                         'domain_regex': [r'^sg[0-9]+\.example\.invalid$']}
         chosen = {'hk': [self.node(hk, 'hk-node')], 'sg': [self.node(sg, 'sg-node')]}
         p = m.build_profile(s, chosen)
         # Only test harness adaptations: replace Android TUN by a local HTTP inbound;
@@ -134,7 +135,8 @@ class LocalNetworkTests(unittest.TestCase):
                         with socket.create_connection(('127.0.0.1', port), timeout=.1): break
                     except OSError: time.sleep(.03)
                 else: self.fail('core did not start')
-                for host, expected in [('127.0.0.1', 'DIRECT'), ('127.0.0.2', 'SG'), ('127.0.0.3', 'HK'), ('sg.example.invalid', 'SG')]:
+                for host, expected in [('127.0.0.1', 'DIRECT'), ('127.0.0.2', 'SG'), ('127.0.0.3', 'HK'),
+                                       ('sg.example.invalid', 'SG'), ('sg7.example.invalid', 'SG')]:
                     result = subprocess.run(['curl', '--silent', '--fail', '--proxy', f'http://127.0.0.1:{port}',
                                              '--noproxy', '', '--max-time', '3',
                                              f'http://{host}:{direct.server_address[1]}/test'], capture_output=True, timeout=5)

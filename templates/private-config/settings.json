@@ -19,12 +19,14 @@
     "direct": {
       "ip_cidr": [],
       "domain": [],
-      "domain_suffix": []
+      "domain_suffix": [],
+      "domain_regex": []
     },
     "singapore": {
       "ip_cidr": [],
       "domain": [],
-      "domain_suffix": []
+      "domain_suffix": [],
+      "domain_regex": []
     },
     "own_hy2": {
       "server": "<OWN_HK_SERVER>",

@@ -116,12 +116,19 @@ def validate(s):
                 'manual_node_scheme')
     for key in ('direct', 'singapore'):
         rules = s[key]
-        require(isinstance(rules, dict) and set(rules) == {'ip_cidr', 'domain', 'domain_suffix'}, 'rule_fields')
+        required = {'ip_cidr', 'domain', 'domain_suffix'}
+        require(isinstance(rules, dict) and required <= set(rules) <= required | {'domain_regex'}, 'rule_fields')
         for field, values in rules.items():
             require(isinstance(values, list) and len(values) <= 10000, 'rule_list')
             for v in values:
                 if field == 'ip_cidr':
                     ipaddress.ip_network(v, strict=False)
+                elif field == 'domain_regex':
+                    require(isinstance(v, str) and 0 < len(v) <= 1024, 'invalid_domain_regex')
+                    try:
+                        re.compile(v)
+                    except re.error:
+                        raise Invalid('invalid_domain_regex') from None
                 else:
                     domain(v)
     w = s.get('wireguard')
@@ -557,7 +564,7 @@ def proxy_options(query):
 
 def remote_set(tag, url):
     return {'type': 'remote', 'tag': tag, 'format': 'binary', 'url': url,
-            'download_detour': 'hk', 'update_interval': '7d'}
+            'http_client': {'detour': 'hk'}, 'update_interval': '7d'}
 
 
 def foreign_rule_url(host, key):
@@ -631,8 +638,8 @@ def build_profile(s, chosen):
         policy.append({'rule_set': ['singapore'], 'action': 'route', 'outbound': 'sg'})
     dns_rules = []
     for name, target in [('direct', 'bootstrap'), ('singapore', 'dns-sg')]:
-        for key in ('domain', 'domain_suffix'):
-            if s[name][key]:
+        for key in ('domain', 'domain_suffix', 'domain_regex'):
+            if s[name].get(key):
                 dns_rules.append({key: s[name][key], 'action': 'route', 'server': target})
     return {
         'log': {'level': 'warn'},

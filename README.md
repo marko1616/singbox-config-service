@@ -30,12 +30,17 @@ python3 -c 'import json,os,shutil,tempfile; from pathlib import Path; from servi
 |---|---|---|
 | 1 | 10.77.0.0/24（仅启用 WireGuard 的 full） | WireGuard；外层仅公网 IPv6/AAAA，没有 IPv4 或代理备用 |
 | 2 | 自定义强制 DIRECT 集 | DIRECT，覆盖新加坡白名单 |
-| 3 | 新加坡白名单：目标 IP/CIDR、精确域名、域名后缀 | 新加坡 |
+| 3 | 新加坡白名单：目标 IP/CIDR、精确域名、域名后缀、域名正则 | 新加坡 |
 | 4 | 其他 | 香港 |
 
 DIRECT 初始收录 35 个中国公共 DNS IP、5 个域名后缀；见 `data/direct.json` 和 `docs/rule-source.md`。
 `global` 模式仍没有 GeoIP/Geosite 规则。`360.cn` 按确认保留，含其所有子域名。
 `domain` 表示精确域名，`domain_suffix` 表示域名及子域名；不写 `domain:`、`*.` 或 URL。
+`domain_regex` 可选，填写 sing-box 的域名正则表达式字符串数组，例如 JSON 中的
+`"^(.+\\.)?example\\.com$"`（实际配置文件需将每个反斜杠写成 `\\`）。
+它在 DIRECT 和新加坡列表中同时用于路由及 DNS 匹配；旧配置不含此字段仍可用。
+表达式应按 sing-box 使用的 Go/RE2 语法编写；不支持回溯引用或环视。
+本地 render 会检查基本语法，最终由 sing-box 核心校验；单条最长 1024 字符。
 IP 和域名条件是 **OR**，不是 AND。域名未提前命中时，解析后再次按内网 → DIRECT → SG 检查目标 IP。
 
 下述 DNS 处理仅描述 global 模式：发往 DIRECT 列表的 DNS 流量直接发出；其他识别到的普通 DNS 交给 sing-box DNS。
