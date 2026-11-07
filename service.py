@@ -26,6 +26,9 @@ PROBE_URL = "https://www.google.com/generate_204"
 CACHEFLY_URL = "https://cachefly.cachefly.net/1mb.test"
 CACHEFLY_BYTES = 131072
 CACHEFLY_SHA256 = "fa43239bcee7b97ca62f007cc68487560a39e19f74f3dde7486db3f98df8e471"
+# DoH resolver for names needed before any tunnel exists (node servers, subscription host).
+# It has to be an IP literal: a hostname here would need DNS to resolve itself.
+BOOTSTRAP_DOH = os.environ.get('SINGBOX_BOOTSTRAP_DOH', 'https://223.5.5.5/dns-query')
 OVERLAY = "10.77.0.0/24"
 CONFIG_PATHS = {f'/api/config-{mode}-{scope}': (mode, scope == 'full')
                 for mode in ('global', 'blacklist', 'whitelist')
@@ -55,6 +58,28 @@ class Invalid(ValueError):
 def require(ok, code):
     if not ok:
         raise Invalid(code)
+
+
+def is_ip_literal(host):
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def bootstrap_dns(detour=None):
+    """Bootstrap over DoH: the tag stays 'bootstrap' so every route rule keeps working."""
+    parts = urllib.parse.urlsplit(BOOTSTRAP_DOH)
+    require(parts.scheme == 'https' and bool(parts.hostname), 'bootstrap_doh')
+    require(is_ip_literal(parts.hostname), 'bootstrap_doh_ip')
+    server = {'type': 'https', 'tag': 'bootstrap', 'server': parts.hostname,
+              'path': parts.path or '/dns-query'}
+    if parts.port:
+        server['server_port'] = parts.port
+    if detour:
+        server['detour'] = detour
+    return server
 
 
 def atomic_write(path, data):
@@ -91,12 +116,40 @@ def domain(value):
     raise Invalid("domain_is_ip")
 
 
+def validate_dns_hosts(hosts):
+    """Validate private exact-name A/AAAA overrides without echoing values."""
+    require(isinstance(hosts, dict) and len(hosts) <= 10000, 'dns_hosts_object')
+    result = {}
+    for name, values in hosts.items():
+        require(isinstance(name, str), 'dns_hosts_domain')
+        name = name.removesuffix('.').lower()
+        try:
+            domain(name)
+        except Invalid:
+            raise Invalid('dns_hosts_domain') from None
+        require(name not in result, 'dns_hosts_duplicate')
+        require(isinstance(values, list) and 1 <= len(values) <= 64, 'dns_hosts_addresses')
+        addresses = []
+        for value in values:
+            require(isinstance(value, str) and '%' not in value, 'dns_hosts_ip')
+            try:
+                address = str(ipaddress.ip_address(value))
+            except ValueError:
+                raise Invalid('dns_hosts_ip') from None
+            if address not in addresses:
+                addresses.append(address)
+        result[name] = addresses
+    return result
+
+
 def validate(s):
     require(isinstance(s, dict), "settings_object")
     fields = {"api_key", "subscription_url", "subscription_user_agent", "top_k", "refresh_seconds",
               "probe_timeout_seconds", "probe_workers", "max_candidates", "hk_pattern", "sg_pattern",
               "direct", "singapore", "wireguard", "own_hy2", "manual_nodes"}
-    require(set(s) in (fields, fields - {'wireguard'}), "settings_fields")
+    require(set(s) - {'dns_hosts'} in (fields, fields - {'wireguard'}), "settings_fields")
+    if 'dns_hosts' in s:
+        s['dns_hosts'] = validate_dns_hosts(s['dns_hosts'])
     require(not any(isinstance(v, str) and v.startswith('<') for v in walk(s)), "unfilled_template")
     require(isinstance(s['api_key'], str) and re.fullmatch(r'[A-Za-z0-9_-]{32,128}', s['api_key']), "api_key_format")
     u = urllib.parse.urlsplit(s['subscription_url'])
@@ -174,7 +227,7 @@ def device_settings(root):
     expected = {'subscription_url', 'subscription_user_agent', 'top_k', 'refresh_seconds',
                 'probe_timeout_seconds', 'probe_workers', 'max_candidates', 'hk_pattern',
                 'sg_pattern', 'direct', 'singapore', 'own_hy2', 'manual_nodes'}
-    require(set(root['shared']) == expected, 'shared_settings')
+    require(set(root['shared']) - {'dns_hosts'} == expected, 'shared_settings')
     result = {}
     keys, addresses, private_keys = set(), set(), set()
     for device in root['devices']:
@@ -318,14 +371,30 @@ def check_profile(profile, core=CORE):
         checked([core, 'check', '-c', str(p)])
 
 
-def fetch(s):
+def fetch(s, attempts=3, backoff=(1, 3)):
+    """Subscription fetch with bounded retries: the inherited proxy path drops connections."""
     request = urllib.request.Request(s['subscription_url'], headers={'User-Agent': s['subscription_user_agent']})
     # urllib inherits standard HTTP(S)_PROXY; no subscription is handed to a third-party converter.
-    with urllib.request.urlopen(request, timeout=30) as r:
-        require(urllib.parse.urlsplit(r.url).scheme == 'https', 'subscription_redirect_https')
-        data = r.read(LIMIT + 1)
-    require(0 < len(data) <= LIMIT, 'subscription_size')
-    return data
+    last = None
+    for attempt in range(1, attempts + 1):
+        start = time.monotonic()
+        try:
+            with urllib.request.urlopen(request, timeout=30) as r:
+                require(urllib.parse.urlsplit(r.url).scheme == 'https', 'subscription_redirect_https')
+                data = r.read(LIMIT + 1)
+            require(0 < len(data) <= LIMIT, 'subscription_size')
+            if attempt > 1:
+                LOG.info('fetch recovered attempt=%d elapsed=%.1fs', attempt, time.monotonic() - start)
+            return data
+        except Invalid:
+            raise  # Settings and payload problems do not improve on a retry.
+        except Exception as exc:
+            last = exc
+            LOG.warning('fetch attempt %d/%d failed after %.1fs: %s',
+                        attempt, attempts, time.monotonic() - start, type(exc).__name__)
+            if attempt < attempts:
+                time.sleep(backoff[min(attempt - 1, len(backoff) - 1)])
+    raise last
 
 
 def convert(data, converter=CONVERTER):
@@ -367,10 +436,12 @@ def _http_probe(node, s, core, url, expected_status, expected_bytes=None,
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
+    # The bootstrap DoH bypasses the tested node: resolving the node's own hostname
+    # through that node would be circular, and plain DNS would leak every lookup.
     p = {'log': {'disabled': True},
-         'dns': {'servers': [{'type': 'local', 'tag': 'bootstrap'}]},
+         'dns': {'servers': [bootstrap_dns('direct')]},
          'inbounds': [{'type': 'http', 'listen': '127.0.0.1', 'listen_port': port}],
-         'outbounds': [node],
+         'outbounds': [node, {'type': 'direct', 'tag': 'direct', 'domain_resolver': 'bootstrap'}],
          'route': {'final': node['tag'], 'default_domain_resolver': 'bootstrap'}}
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / 'probe.json'
@@ -462,7 +533,7 @@ def select(nodes, s, measure=probe, checker=check_profile, measure_download=None
     candidates = groups['hk'] + groups['sg']
     require(len(candidates) <= s['max_candidates'], 'candidate_limit')
     # Do not misclassify unsupported syntax as an unreachable node and enter fallback.
-    checker({'dns': {'servers': [{'type': 'local', 'tag': 'bootstrap'}]},
+    checker({'dns': {'servers': [bootstrap_dns()]},
              'outbounds': candidates, 'route': {'default_domain_resolver': 'bootstrap'}})
     with ThreadPoolExecutor(max_workers=s['probe_workers']) as pool:
         times = list(pool.map(lambda n: measure(n, s), candidates))
@@ -497,18 +568,26 @@ def select(nodes, s, measure=probe, checker=check_profile, measure_download=None
         verified.sort(key=lambda item: (item[0], item[1]))
         chosen[g] = [node for _, _, node in verified[:s['top_k']]]
         selected = {node['tag'] for node in chosen[g]}
+        tally = {}
         for node in values:
             tag = node['tag']
             reason = ('google_failed' if google_times[tag] is None else
                       'not_shortlisted' if tag not in download_results else
                       'cachefly_failed' if download_results[tag] is None else
                       'selected' if tag in selected else 'top_k_excluded')
+            tally[reason] = tally.get(reason, 0) + 1
             LOG.debug('decision region=%s tag=%s result=%s', g, node_log_tag(node), reason)
         counts[g] = {'tested': len(values), 'healthy': len(verified), 'retained': len(chosen[g])}
+        # One line per region at INFO; an empty pool is a WARNING, so it never hides at DEBUG.
+        (LOG.warning if not chosen[g] else LOG.info)(
+            'region %s: tested=%d google_ok=%d verified=%d retained=%d decisions=%s',
+            g, len(values), len(google_ok), len(verified), len(chosen[g]), tally)
     require(chosen['sg'], 'singapore_unavailable')
     fallback = not chosen['hk']
     own = dict(copy.deepcopy(s['own_hy2']), type='hysteria2', tag='hk-own-hy2')
     if fallback:
+        LOG.warning('hk pool empty: tested=%d, falling back to own_hy2 tag=%s',
+                    counts['hk']['tested'], node_log_tag(own))
         LOG.debug('candidate result=included region=hk tag=%s endpoint=%s port=%s protocol=hysteria2',
                   node_log_tag(own), node_endpoint(own), own.get('server_port'))
         own_google = measure(own, s)
@@ -631,14 +710,23 @@ def variant_profile(base, mode, full, inbound, foreign_url=None):
     if mode == 'whitelist':
         policy.append({'rule_set': ['geoip-foreign', 'geosite-foreign'], 'action': 'route', 'outbound': 'hk'})
     p['route']['final'] = 'direct' if mode == 'whitelist' else 'hk'
-    p['route']['rules'] = [{'action': 'sniff', 'sniffer': ['http', 'tls', 'quic', 'dns']}] + copy.deepcopy(policy) + [
+    p['route']['rules'] = [{'action': 'sniff', 'sniffer': ['http', 'tls', 'quic', 'dns']}] + hosts_resolve_rules(p['dns']) + copy.deepcopy(policy) + [
         {'protocol': 'dns', 'action': 'hijack-dns'}, {'action': 'resolve'}] + policy
     if mode == 'blacklist':
-        p['dns']['rules'].insert(0, {'rule_set': ['geosite-cn'], 'action': 'route', 'server': 'bootstrap'})
+        p['dns']['rules'].insert(len(hosts_resolve_rules(p['dns'])), {'rule_set': ['geosite-cn'], 'action': 'route', 'server': 'bootstrap'})
     if mode == 'whitelist':
         p['dns']['rules'].append({'rule_set': ['geosite-foreign'], 'action': 'route', 'server': 'dns-hk'})
         p['dns']['final'] = 'bootstrap'
     return p
+
+
+def hosts_resolve_rules(dns):
+    # Resolve proxy domain requests before a terminating domain-based route.
+    for server in dns['servers']:
+        if server['tag'] == 'dns-hosts':
+            return [{'domain': list(server['predefined']), 'action': 'resolve',
+                     'server': 'dns-hosts'}]
+    return []
 
 
 def build_profile(s, chosen):
@@ -657,15 +745,19 @@ def build_profile(s, chosen):
     policy.append({'rule_set': ['force-direct'], 'action': 'route', 'outbound': 'direct'})
     if rule_items(s['singapore']):
         policy.append({'rule_set': ['singapore'], 'action': 'route', 'outbound': 'sg'})
-    dns_rules = []
+    hosts = validate_dns_hosts(s.get('dns_hosts', {}))
+    hosts_servers = ([{'type': 'hosts', 'tag': 'dns-hosts', 'predefined': hosts}]
+                     if hosts else [])
+    dns_rules = ([{'domain': list(hosts), 'action': 'route', 'server': 'dns-hosts'}]
+                 if hosts else [])
     for name, target in [('direct', 'bootstrap'), ('singapore', 'dns-sg')]:
         for key in ('domain', 'domain_suffix', 'domain_regex'):
             if s[name].get(key):
                 dns_rules.append({key: s[name][key], 'action': 'route', 'server': target})
     return {
         'log': {'level': 'warn'},
-        'dns': {'servers': [
-            {'type': 'local', 'tag': 'bootstrap'},
+        'dns': {'servers': hosts_servers + [
+            bootstrap_dns('direct'),
             {'type': 'https', 'tag': 'dns-hk', 'server': '1.1.1.1', 'path': '/dns-query', 'detour': 'hk'},
             {'type': 'https', 'tag': 'dns-sg', 'server': '1.1.1.1', 'path': '/dns-query', 'detour': 'sg'}],
             'rules': dns_rules, 'final': 'dns-hk'},
@@ -681,7 +773,8 @@ def build_profile(s, chosen):
         'outbounds': outbounds,
         'route': {'auto_detect_interface': True, 'default_domain_resolver': 'bootstrap',
                   'rule_set': sets, 'final': 'hk',
-                  'rules': [{'action': 'sniff', 'sniffer': ['http', 'tls', 'quic', 'dns']}] + copy.deepcopy(policy) +
+                  'rules': [{'action': 'sniff', 'sniffer': ['http', 'tls', 'quic', 'dns']}] +
+                           hosts_resolve_rules({'servers': hosts_servers}) + copy.deepcopy(policy) +
                            [{'protocol': 'dns', 'action': 'hijack-dns'}, {'action': 'resolve'}] + policy}
     }
 

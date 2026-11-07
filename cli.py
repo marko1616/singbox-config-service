@@ -41,6 +41,11 @@ ERROR_HELP = {
     "duplicate_wireguard_address": "each device needs a distinct WireGuard address",
     "duplicate_wireguard_private_key": "each device needs a distinct WireGuard private key",
     "rule_fields": "direct/singapore need ip_cidr, domain and domain_suffix; domain_regex is optional",
+    "dns_hosts_object": "shared.dns_hosts must be an object with at most 10000 exact domains",
+    "dns_hosts_domain": "dns_hosts keys must be plain domains (ASCII or punycode), not URLs, IPs or wildcards",
+    "dns_hosts_duplicate": "dns_hosts has duplicate domains after case and trailing-dot normalization",
+    "dns_hosts_addresses": "each dns_hosts value must be a list of 1-64 IP address strings",
+    "dns_hosts_ip": "dns_hosts addresses must be IPv4 or IPv6 literals without CIDR, port or zone suffix",
     "manual_nodes_list": "manual_nodes must be a list of at most 200 URI strings",
     "manual_node_entry": "each manual_nodes entry must be one single-line URI string",
     "manual_node_scheme": "manual_nodes entry scheme must be one of vmess/vless/trojan/hysteria2/hysteria/tuic/anytls/ss/socks/http",
@@ -68,6 +73,8 @@ ERROR_HELP = {
     "compose_unavailable": "docker compose (or docker-compose) is not installed",
     "docker_daemon_unreachable": "the Docker daemon is not reachable with or without sudo",
     "log_level": "SINGBOX_LOG_LEVEL must be DEBUG, INFO, WARNING or ERROR",
+    "bootstrap_doh": "SINGBOX_BOOTSTRAP_DOH must be an https:// URL",
+    "bootstrap_doh_ip": "SINGBOX_BOOTSTRAP_DOH must use an IP address: a hostname would need DNS to resolve itself",
     "unknown_action": "unknown action",
 }
 

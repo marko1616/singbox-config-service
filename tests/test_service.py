@@ -188,6 +188,52 @@ class SelectionTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_dns_hosts_legacy_and_validation(self):
+        s = settings(); s.pop('dns_hosts', None)
+        baseline = copy.deepcopy(s)
+        m.validate(s)
+        self.assertNotIn('dns_hosts', s)
+        self.assertEqual(s, baseline)
+        m.device_settings(root_settings(s))
+        s['dns_hosts'] = {'EXAMPLE.invalid.': ['192.0.2.9', '2001:0db8::9', '192.0.2.9']}
+        effective = m.device_settings(root_settings(s))['phone']
+        self.assertEqual(effective['dns_hosts'], {'example.invalid': ['192.0.2.9', '2001:db8::9']})
+        bad = [([], 'object'), ({'https://secret.invalid': ['192.0.2.1']}, 'domain'),
+               ({'*.example.invalid': ['192.0.2.1']}, 'domain'),
+               ({'192.0.2.1': ['192.0.2.1']}, 'domain'),
+               ({'x.invalid': []}, 'addresses'), ({'x.invalid': '192.0.2.1'}, 'addresses'),
+               ({'x.invalid': [1]}, 'ip'), ({'x.invalid': ['192.0.2.1/32']}, 'ip'),
+               ({'x.invalid': ['fe80::1%eth0']}, 'ip'),
+               ({'x.invalid': ['secret-invalid-value']}, 'ip'),
+               ({'X.invalid.': ['::1'], 'x.invalid': ['::1']}, 'duplicate')]
+        for value, code in bad:
+            with self.subTest(value=value):
+                s['dns_hosts'] = value
+                with self.assertRaisesRegex(m.Invalid, '^dns_hosts_' + code + '$'):
+                    m.device_settings(root_settings(s))
+                self.assertIn('dns_hosts_' + code, cli.ERROR_HELP)
+
+    def test_dns_hosts_all_variants_real_core_and_legacy_unchanged(self):
+        s = settings(); s.pop('dns_hosts', None)
+        chosen, _ = m.select(nodes(), s, lambda n, s: 1, no_check)
+        legacy = m.build_profile(s, chosen)
+        s['dns_hosts'] = {}
+        self.assertEqual(m.build_profile(s, chosen), legacy)
+        s['dns_hosts'] = {'exact.example.invalid': ['192.0.2.9', '2001:db8::9']}
+        base = m.build_profile(s, chosen)
+        for mode in ('global', 'blacklist', 'whitelist'):
+            for full in (False, True):
+                p = m.variant_profile(base, mode, full, m.proxy_options({}),
+                                      'https://example.invalid/api/rules/geoip-foreign.srs')
+                self.assertEqual(p['dns']['rules'][0]['server'], 'dns-hosts')
+                self.assertEqual(p['route']['rules'][1], {
+                    'domain': ['exact.example.invalid'], 'action': 'resolve', 'server': 'dns-hosts'})
+                self.assertEqual(p['route']['default_domain_resolver'], 'bootstrap')
+                m.check_profile(p)
+        self.assertEqual(base, m.build_profile(s, chosen))
+        s['dns_hosts'] = {}
+        self.assertEqual(m.build_profile(s, chosen), legacy)
+
     def test_public_base_url_with_proxy_prefix(self):
         root = root_settings()
         root['public_base_url'] = 'https://example.invalid/sfa/'
@@ -371,6 +417,34 @@ class PublisherTests(unittest.TestCase):
         self.p = m.Publisher(self.settings, self.root / 'snapshot.json', fetcher=lambda s: b'fixture',
                              converter=lambda b: nodes(), measure=lambda n, s: 1, checker=m.check_profile)
 
+    def test_dns_hosts_publish_change_failure_recovery_and_removal(self):
+        self.s = add_second_device(self.s)
+        self.s['shared']['dns_hosts'] = {'custom.invalid': ['192.0.2.9']}
+        m.atomic_write(self.settings, m.encode(self.s))
+        self.assertTrue(self.p.refresh())
+        old, snapshot = copy.deepcopy(self.p.data), self.p.snapshot.read_bytes()
+        for data in old.values():
+            self.assertEqual(json.loads(data)['dns']['servers'][0]['predefined'],
+                             {'custom.invalid': ['192.0.2.9']})
+        self.s['shared']['dns_hosts']['custom.invalid'] = ['not-an-ip']
+        m.atomic_write(self.settings, m.encode(self.s))
+        self.assertFalse(self.p.refresh())
+        self.assertEqual(self.p.error, 'dns_hosts_ip')
+        self.assertEqual(self.p.data, old)
+        self.assertEqual(self.p.snapshot.read_bytes(), snapshot)
+        self.s['shared']['dns_hosts']['custom.invalid'] = ['2001:db8::9']
+        m.atomic_write(self.settings, m.encode(self.s))
+        self.assertTrue(self.p.refresh())
+        self.assertNotEqual(self.p.data, old)
+        restored = m.Publisher(self.settings, self.p.snapshot)
+        restored.restore()
+        self.assertEqual(restored.data, self.p.data)
+        del self.s['shared']['dns_hosts']
+        m.atomic_write(self.settings, m.encode(self.s))
+        self.assertTrue(self.p.refresh())
+        for data in self.p.data.values():
+            self.assertNotIn('dns-hosts', data.decode())
+
     def test_refresh_failure_and_restart_preserve_valid_snapshot(self):
         self.assertTrue(self.p.refresh(), self.p.status())
         old = self.p.data
@@ -547,10 +621,12 @@ class RenderTests(unittest.TestCase):
             target = cli.initialize(r)
             with self.assertRaises(FileExistsError): cli.initialize(r)
             with self.assertRaises(m.Invalid): cli.render(r)
-            s = root_settings(); s['shared']['direct'] = {'domain': ['extra.example.invalid'], 'domain_suffix': [], 'ip_cidr': []}
+            s = root_settings(); s['shared']['dns_hosts'] = {'custom.invalid': ['192.0.2.9']}
+            s['shared']['direct'] = {'domain': ['extra.example.invalid'], 'domain_suffix': [], 'ip_cidr': []}
             m.atomic_write(target, m.encode(s))
             out = cli.render(r)
             result = m.load_settings(out)
+            self.assertEqual(result['shared']['dns_hosts'], {'custom.invalid': ['192.0.2.9']})
             self.assertIn('extra.example.invalid', result['shared']['direct']['domain'])
             self.assertEqual(len(result['shared']['direct']['ip_cidr']), 35)
             self.assertEqual(out.stat().st_mode & 0o777, 0o600)

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import socket
 import socketserver
+import struct
 import subprocess
 import tempfile
 import threading
@@ -76,6 +77,110 @@ class LocalNetworkTests(unittest.TestCase):
                     self.assertEqual(result.stdout, b'HK')
             finally:
                 proc.terminate(); proc.wait(timeout=3); proc.stderr.close()
+
+    def test_dns_hosts_actual_answers_and_proxy_destinations_all_modes(self):
+        direct, hk, sg = self.server('DIRECT'), self.server('HK'), self.server('SG')
+        s = settings(); s.pop('wireguard')
+        s['dns_hosts'] = {
+            'direct.example.invalid': ['127.0.0.1'],
+            'sg.example.invalid': ['192.0.2.8'],
+            'hk.example.invalid': ['192.0.2.9'],
+            'dual.example.invalid': ['192.0.2.10', '192.0.2.11', '2001:db8::10'],
+            'v6.example.invalid': ['2001:db8::11']}
+        s['direct'] = {'domain': ['direct.example.invalid'], 'ip_cidr': [], 'domain_suffix': []}
+        s['singapore'] = {'domain': ['sg.example.invalid'], 'ip_cidr': [], 'domain_suffix': []}
+        chosen = {'hk': [self.node(hk, 'hk-node')], 'sg': [self.node(sg, 'sg-node')]}
+
+        def query(port, name, qtype):
+            labels = name.split('.')
+            wire_name = b''.join(bytes([len(x)]) + x.encode() for x in labels) + b'\0'
+            packet = struct.pack('!6H', 1234, 0x100, 1, 0, 0, 0) + wire_name + struct.pack('!2H', qtype, 1)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(2); sock.sendto(packet, ('127.0.0.1', port))
+                response = sock.recv(4096)
+            ident, flags, qd, count, _, _ = struct.unpack_from('!6H', response)
+            self.assertEqual(ident, 1234)
+            self.assertEqual(qd, 1)
+            def skip_name(offset):
+                while response[offset]:
+                    if response[offset] & 0xc0 == 0xc0:
+                        return offset + 2
+                    offset += 1 + response[offset]
+                return offset + 1
+            offset = skip_name(12) + 4
+            addresses = []
+            for _ in range(count):
+                offset = skip_name(offset)
+                rtype, cls, ttl, length = struct.unpack_from('!HHIH', response, offset)
+                offset += 10
+                self.assertEqual(cls, 1)
+                if rtype in (1, 28):
+                    addresses.append(socket.inet_ntop(socket.AF_INET if rtype == 1 else socket.AF_INET6,
+                                                      response[offset:offset + length]))
+                offset += length
+            return flags & 15, addresses
+
+        for mode in ('global', 'blacklist', 'whitelist'):
+            with self.subTest(mode=mode), socket.socket() as tcp, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+                tcp.bind(('127.0.0.1', 0)); port = tcp.getsockname()[1]
+                udp.bind(('127.0.0.1', 0)); dns_port = udp.getsockname()[1]
+            p = m.variant_profile(m.build_profile(s, chosen), mode, False,
+                                  m.proxy_options({'port': [str(port)]}),
+                                  'https://example.invalid/geoip-foreign.srs')
+            # Preserve generated hosts/rules. Replace only external DNS and rule downloads
+            # with deterministic fixtures; no WAN, TUN or real proxy credentials involved.
+            for server in p['dns']['servers']:
+                if server['tag'] != 'dns-hosts':
+                    tag = server['tag']
+                    server.clear(); server.update(type='hosts', tag=tag,
+                        predefined={'untouched.invalid': ['192.0.2.77'],
+                                    'child.dual.example.invalid': ['192.0.2.78']})
+            for rule_set in p['route']['rule_set']:
+                if rule_set['type'] == 'remote':
+                    tag = rule_set['tag']
+                    rule_set.clear(); rule_set.update(type='inline', tag=tag, rules=[
+                        {'domain': ['direct.example.invalid'] if tag == 'geosite-cn' else
+                         ['hk.example.invalid'] if tag == 'geosite-foreign' else ['unused.invalid']}])
+            p['inbounds'].append({'type': 'direct', 'tag': 'dns-test', 'listen': '127.0.0.1',
+                                  'listen_port': dns_port, 'network': 'udp'})
+            p['route']['rules'].insert(0, {'inbound': ['dns-test'], 'action': 'hijack-dns'})
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'runtime.json'; path.write_bytes(m.encode(p))
+                proc = subprocess.Popen([m.CORE, 'run', '-c', str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                try:
+                    for _ in range(100):
+                        if proc.poll() is not None:
+                            self.fail(proc.stderr.read().decode())
+                        try:
+                            with socket.create_connection(('127.0.0.1', port), timeout=.1): break
+                        except OSError: time.sleep(.03)
+                    else: self.fail('core did not start')
+                    for name, qtype, expected in [
+                        ('DUAL.example.invalid', 1, ['192.0.2.10', '192.0.2.11']),
+                        ('dual.example.invalid', 28, ['2001:db8::10']),
+                        ('direct.example.invalid', 1, ['127.0.0.1']),
+                        ('sg.example.invalid', 1, ['192.0.2.8']),
+                        ('v6.example.invalid', 1, []),
+                        ('v6.example.invalid', 28, ['2001:db8::11']),
+                        ('direct.example.invalid', 28, []),
+                        ('untouched.invalid', 1, ['192.0.2.77']),
+                        ('child.dual.example.invalid', 1, ['192.0.2.78'])]:
+                        code, answers = query(dns_port, name, qtype)
+                        self.assertEqual(code, 0, (mode, name, qtype))
+                        self.assertEqual(set(answers), set(expected), (mode, name, qtype))
+                    self.assertEqual(query(dns_port, 'dual.example.invalid', 16), (3, []))
+                    for proxy in (f'http://127.0.0.1:{port}', f'socks5h://127.0.0.1:{port}'):
+                        for name, label in [('direct', 'DIRECT'), ('sg', 'SG'), ('hk', 'HK')]:
+                            result = subprocess.run(['curl', '--silent', '--show-error', '--fail',
+                                '--proxy', proxy, '--noproxy', '', '--max-time', '3',
+                                f'http://{name}.example.invalid:{direct.server_address[1]}/test'],
+                                capture_output=True, timeout=5)
+                            self.assertEqual(result.returncode, 0, (mode, name, result.stderr))
+                            self.assertEqual(result.stdout.decode(), label)
+                    self.assertTrue(all(b'192.0.2.8:' in hit for hit in sg.hits), sg.hits)
+                    self.assertTrue(all(b'192.0.2.9:' in hit for hit in hk.hits), hk.hits)
+                finally:
+                    proc.terminate(); proc.wait(timeout=3); proc.stderr.close()
 
     def test_actual_probe_uses_outbound_despite_no_proxy(self):
         proxy = self.server('proxied')

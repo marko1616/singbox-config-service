@@ -35,6 +35,53 @@ https://<你的配置域名>/api/config-global-full?key=<该设备的API_KEY>
 
 状态、日志、诊断和停止服务都可在菜单中操作。不要将私有设置、渲染结果或快照提交到 Git；反代也不应记录或缓存带 key 的配置 URL。
 
+## 域名解析（DoH）
+
+节点域名（`server`）、订阅地址等「隧道建立之前」就要解析的名字，统一走 `bootstrap`
+这个解析器，类型是 **DoH over IP**，默认 `https://223.5.5.5/dns-query`：
+
+- 不再用系统解析器，节点域名不会以明文 DNS 泄露给本地网络（DoH 提供方仍能看到查询内容）；
+- 必须是 IP 字面量：写域名会变成「用 DNS 解析 DNS」的循环；
+- 改法：`SINGBOX_BOOTSTRAP_DOH=https://1.1.1.1/dns-query` 后再 `cli.py up`；
+- 业务流量仍走 `dns-hk`（`1.1.1.1` DoH，`detour: hk`），两条链路互不影响。
+
+## 手动域名解析记录
+
+在 `private-config/settings.json` 的 `shared` 对象里添加可选的 `dns_hosts`：
+
+```json
+"dns_hosts": {
+  "app.example.com": ["192.0.2.10"],
+  "dual.example.com": ["192.0.2.20", "2001:db8::20"]
+}
+```
+
+以上地址仅为文档示例，使用时替换为实际目标地址。实际域名和地址只放私有配置，不要改公开模板或提交到 Git。
+
+- 精确匹配域名，不匹配子域名；支持多条 IPv4（A）/IPv6（AAAA）。大小写和末尾一个点会规范化；国际化域名用 punycode。值必须是非空地址数组，不支持 URL、端口、CIDR、zone、通配符或 CNAME。
+- 对所有设备、`global` / `blacklist` / `whitelist`、`full` / `proxyonly` 生效。静态记录优先于 DIRECT、SG 和中国域名 DNS 规则；HTTP/SOCKS 的域名目标也会先解析，避免代理节点重新解析绕过覆盖。**解析记录不指定出站**，实际目标仍按原有路由规则选路；IP 类规则会看到覆盖后的 IP。
+- 使用 sing-box 原生 [hosts DNS](https://sing-box.sagernet.org/configuration/dns/server/hosts/)。只配置 A 时 AAAA 返回空结果，不回退公网解析（反之亦然）；其他记录类型由 hosts 返回 NXDOMAIN，不支持 TXT/MX/HTTPS 等记录。
+- 仅覆盖进入 sing-box DNS 或以域名进入代理的业务请求。不会修改系统 hosts、上游权威 DNS、订阅拉取、节点/WireGuard 端点的 bootstrap 解析；应用自行使用 DoH、已解析成 IP 或被现有 DIRECT DNS 例外放行的查询不保证经过覆盖。
+- 不填字段或设为 `{}` 保持旧行为。最多 10000 个域名，每个最多 64 个地址；规范化后的重复域名、空数组或非法地址会拒绝 Render/刷新，不静默忽略。运行中刷新失败保留上一份有效配置。
+
+**首次启用**：审查应用补丁 → 用 Neovim 编辑私有配置 → 菜单 **Render private runtime settings** → **Build service image** → **Start service** → 日志确认本轮发布成功 → 客户端刷新并重新应用远程配置。必要时重启使用该域名的应用，清除其旧连接/缓存。
+
+**后续增删改**：编辑私有配置后只需 Render，等待下一轮成功发布，再刷新并重新应用客户端配置；仅 Build/Start 不会读取新的私有源文件。删除某个键即恢复该域名的原有解析策略，清空 `{}` 可停用全部覆盖，原有救援配置应继续保留。
+
+## 日志与排障
+
+每轮刷新会为每个地区打一行汇总，默认 INFO 就能看到：
+
+```
+region hk: tested=10 google_ok=0 verified=0 retained=0 decisions={'google_failed': 10}
+```
+
+`retained=0` 时该行是 WARNING，并紧跟一条 `hk pool empty: tested=10, falling back to own_hy2`，
+说明这一轮香港候选全部不可用、配置里只剩自有备用节点。逐节点细节（每个候选的
+included/excluded、google 与 cachefly 结果、curl 退出码）用
+`SINGBOX_LOG_LEVEL=DEBUG python3 cli.py up` 打开，看完改回 INFO。
+订阅拉取最多尝试 3 次（1 秒、3 秒退避），每次失败记 `fetch attempt n/3 failed`。
+
 ## 边界与文档
 
 节点测速发生在容器网络中；刷新失败时保留上一组有效配置。服务不能即时切换正在运行的客户端配置，不能保证手机网络到同一节点也可用，也不会在 WireGuard 路径故障时自动切换。没有 WireGuard 的设备可用 `proxyonly`；新加坡没有备用节点。

@@ -14,6 +14,8 @@ services:
       HTTPS_PROXY: ${HTTPS_PROXY:-${https_proxy:-}}
       NO_PROXY: ${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}
       SINGBOX_LOG_LEVEL: ${SINGBOX_LOG_LEVEL:-INFO}
+      # Bootstrap DoH for node hostnames; defaults to https://223.5.5.5/dns-query
+      SINGBOX_BOOTSTRAP_DOH: ${SINGBOX_BOOTSTRAP_DOH:-https://223.5.5.5/dns-query}
     volumes:
       - ./runtime:/config:ro
       - ./state:/state
