@@ -37,6 +37,87 @@ class Proxy(socketserver.StreamRequestHandler):
 
 
 class LocalNetworkTests(unittest.TestCase):
+    def test_default_selector_switch_to_japan_keeps_sg_and_direct_in_all_modes(self):
+        direct, hk, sg, jp = [self.server(name) for name in ('DIRECT', 'HK', 'SG', 'JP')]
+        s = settings(); s.pop('wireguard')
+        s['direct'] = {'ip_cidr': ['127.0.0.1/32'], 'domain': [], 'domain_suffix': []}
+        s['singapore'] = {'ip_cidr': ['127.0.0.1/32', '127.0.0.2/32'], 'domain': [], 'domain_suffix': []}
+        chosen = {'hk': [self.node(hk, '香港-家宽-001')], 'sg': [self.node(sg, '新加坡-普通-001')]}
+        chosen['all'] = chosen['hk'] + chosen['sg'] + [self.node(jp, '日本-住宅-001')]
+        for mode in ('global', 'blacklist', 'whitelist'):
+            with self.subTest(mode=mode):
+                with socket.socket() as listener:
+                    listener.bind(('127.0.0.1', 0)); port = listener.getsockname()[1]
+                p = m.variant_profile(m.build_profile(s, chosen), mode, False,
+                    m.proxy_options({'port': [str(port)]}), 'https://example.invalid/foreign.srs')
+                default = next(n for n in p['outbounds'] if n['tag'] == 'proxy')
+                self.assertEqual({n['tag'] for n in p['outbounds'] if n['type'] == 'selector'}, {'proxy', 'sg'})
+                default['default'] = '日本-住宅-001'
+                self.assertEqual(set(default['outbounds']), {'香港-家宽-001', '新加坡-普通-001', '日本-住宅-001'})
+                p['dns']['servers'] = [{'type': 'local', 'tag': tag}
+                                      for tag in ('bootstrap', 'dns-proxy', 'dns-sg')]
+                for rule_set in p['route']['rule_set']:
+                    if rule_set['type'] == 'remote':
+                        tag = rule_set['tag']
+                        rule_set.clear(); rule_set.update(type='inline', tag=tag,
+                            rules=[{'ip_cidr': ['127.0.0.3/32']}] if tag == 'geoip-foreign'
+                            else [{'ip_cidr': ['192.0.2.0/24']}])
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / 'profile.json'; path.write_bytes(m.encode(p))
+                    proc = subprocess.Popen([m.CORE, 'run', '-c', str(path)],
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    try:
+                        for _ in range(100):
+                            if proc.poll() is not None:
+                                self.fail(proc.stderr.read().decode())
+                            try:
+                                with socket.create_connection(('127.0.0.1', port), timeout=.1): break
+                            except OSError: time.sleep(.03)
+                        else: self.fail('core did not start')
+                        for host, expected in [('127.0.0.1', b'DIRECT'), ('127.0.0.2', b'SG'), ('127.0.0.3', b'JP')]:
+                            r = subprocess.run(['curl', '--silent', '--fail', '--proxy', f'http://127.0.0.1:{port}',
+                                '--noproxy', '', '--max-time', '3', f'http://{host}:{direct.server_address[1]}/test'],
+                                capture_output=True, timeout=5)
+                            self.assertEqual(r.returncode, 0, r.stderr)
+                            self.assertEqual(r.stdout, expected)
+                    finally:
+                        proc.terminate(); proc.wait(timeout=3); proc.stderr.close()
+
+    def test_composed_proxy_sg_and_dns_hosts_work_independently_at_runtime(self):
+        from test_composition import composed
+        direct, hk, sg = [self.server(name) for name in ('DIRECT', 'HK', 'SG')]
+        chosen = {'hk': [self.node(hk, 'HK')], 'sg': [self.node(sg, 'SG')]}
+        chosen['all'] = chosen['hk'] + chosen['sg']
+        for services, host, expected in [(['normal'], '127.0.0.1', b'HK'),
+                                         (['sg-business'], '127.0.0.1', b'SG'),
+                                         (['resolver'], 'pin.example.invalid', b'DIRECT'),
+                                         ([], '127.0.0.1', b'DIRECT')]:
+            root = composed(services)
+            root['services']['sg-business']['rules'] = {'ip_cidr': ['127.0.0.1/32'], 'domain': [], 'domain_suffix': []}
+            root['services']['resolver']['hosts'] = {'pin.example.invalid': ['127.0.0.1']}
+            st = m.device_settings(root)['phone']
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
+            p = m.client_variant(m.build_profile(st, chosen), st, m.proxy_options({'port': [str(port)]}))
+            # The fixture endpoints are literal loopback addresses: no upstream DNS/network needed.
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'profile.json'; path.write_bytes(m.encode(p))
+                proc = subprocess.Popen([m.CORE, 'run', '-c', str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                try:
+                    for _ in range(100):
+                        if proc.poll() is not None: self.fail(proc.stderr.read().decode())
+                        try:
+                            with socket.create_connection(('127.0.0.1', port), timeout=.1): break
+                        except OSError: time.sleep(.03)
+                    else: self.fail('core did not start')
+                    r = subprocess.run(['curl', '--silent', '--fail', '--proxy', f'http://127.0.0.1:{port}',
+                        '--noproxy', '', '--max-time', '3', f'http://{host}:{direct.server_address[1]}/test'],
+                        capture_output=True, timeout=5)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertEqual(r.stdout, expected, services)
+                finally:
+                    proc.terminate(); proc.wait(timeout=3); proc.stderr.close()
+
     def server(self, label):
         server = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Proxy)
         server.daemon_threads = True
@@ -56,7 +137,7 @@ class LocalNetworkTests(unittest.TestCase):
             sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
         p = m.variant_profile(m.build_profile(s, chosen), 'global', False,
                               m.proxy_options({'port': [str(port)]}))
-        p['dns']['servers'] = [{'type': 'local', 'tag': tag} for tag in ['bootstrap', 'dns-hk', 'dns-sg']]
+        p['dns']['servers'] = [{'type': 'local', 'tag': tag} for tag in ['bootstrap', 'dns-proxy', 'dns-sg']]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'runtime.json'; path.write_bytes(m.encode(p))
             proc = subprocess.Popen([m.CORE, 'run', '-c', str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -228,7 +309,7 @@ class LocalNetworkTests(unittest.TestCase):
         p['inbounds'] = [{'type': 'http', 'listen': '127.0.0.1', 'listen_port': port}]
         p['endpoints'][0]['peers'][0]['address'] = '::1'
         p['endpoints'][0]['peers'][0]['persistent_keepalive_interval'] = 0
-        p['dns']['servers'] = [{'type': 'local', 'tag': tag} for tag in ['bootstrap', 'dns-hk', 'dns-sg']]
+        p['dns']['servers'] = [{'type': 'local', 'tag': tag} for tag in ['bootstrap', 'dns-proxy', 'dns-sg']]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'runtime.json'; path.write_bytes(m.encode(p))
             proc = subprocess.Popen([m.CORE, 'run', '-c', str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

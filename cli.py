@@ -27,13 +27,40 @@ DEPLOY_ACTIONS = ("build", "up", "down", "logs", "logs-follow", "status", "diagn
 # Static error identifiers mapped to actionable English, so the menu never
 # shows a bare code and never echoes user-supplied values.
 ERROR_HELP = {
+    "subscriptions_list": "subscriptions must contain 1-32 source objects",
+    "subscription_source": "each source needs url; name/user_agent/fetch_method/rename_rules are optional",
+    "subscription_source_conflict": "use subscriptions OR legacy subscription_url, not both",
+    "subscription_source_name": "source names must be unique, with 1-64 ASCII letters, digits, underscores or hyphens",
+    "subscription_fetch_method": "fetch_method must be curl or urllib",
+    "subscription_fetch_failed": "subscription fetch failed; check access and the per-source user_agent",
+    "all_subscriptions_failed": "no subscription produced nodes; the previous publication is retained",
+    "rename_rules": "rename_rules must be a list of at most 100 rules",
+    "rename_rule": "each rename rule needs pattern/replacement; capture_defaults is optional",
+    "rename_pattern": "rename pattern must be a valid regex of 1-1024 characters",
+    "rename_replacement": "use capture references $1, $2, ..., $index and escaped $$ in replacement",
+    "rename_capture_defaults": "capture_defaults maps existing capture numbers to literal strings",
+    "rename_capture": "a replacement refers to a capture group absent from its pattern",
+    "renamed_node_tag": "renamed tags must be nonempty, at most 512 characters and contain no control characters",
+    "invalid_probe_interval_seconds": "probe_interval_seconds must be an integer between 30 and 86400",
     "unfilled_template": "settings.json still contains <PLACEHOLDER> values",
     "api_key_format": "api_key must be 32-128 URL-safe characters: A-Z a-z 0-9 _ -",
     "settings_owner_permissions": "private-config/settings.json must be owned by you, mode 0600",
     "settings_fields": "settings.json has missing or unexpected top-level keys",
     "invalid_public_base_url": "public_base_url must be an HTTPS origin with an optional plain path prefix, and no query or fragment",
     "devices_list": "devices must contain 1-64 device objects",
-    "device_fields": "each device needs id and api_key; wireguard is optional",
+    "device_fields": "each client needs id/api_key and services when a catalog is present; mode/ingress/wireguard are optional",
+    "services_object": "services must be a named capability catalog",
+    "service_type": "service type must be proxy, singapore, dns, direct or wireguard",
+    "service_fields": "direct/singapore require rules; dns requires hosts; proxy/wireguard only take type",
+    "client_services": "client services must reference distinct names in the service catalog",
+    "duplicate_service_type": "select at most one service of each type per client",
+    "composition_legacy_conflict": "move shared direct/singapore/dns_hosts into named services before enabling composition",
+    "wireguard_service_config": "select a wireguard service and provide client wireguard credentials together",
+    "client_ingress": "ingress must be mixed, tun or both, independently of WireGuard",
+    "mode_requires_proxy": "blacklist/whitelist require the proxy capability; otherwise use global",
+    "subscription_update_policy": "update_policy must be poll or startup",
+    "subscription_interval": "interval_seconds must be an integer between 30 and 86400",
+    "startup_interval_conflict": "a startup source has no polling interval; remove interval_seconds",
     "wireguard_not_configured": "this device has no WireGuard; use a proxyonly config URL",
     "device_id": "device id must be unique and use 1-64 URL-safe characters",
     "shared_settings": "shared must contain exactly the server-wide settings",
@@ -51,8 +78,7 @@ ERROR_HELP = {
     "manual_node_scheme": "manual_nodes entry scheme must be one of vmess/vless/trojan/hysteria2/hysteria/tuic/anytls/ss/socks/http",
     "manual_node_rejected": "the local converter dropped a manual_nodes entry; check that link",
     "singapore_unavailable": "no usable Singapore node: fix the subscription or the sg_pattern",
-    "hong_kong_unavailable": "no usable Hong Kong node and the own_hy2 backup is unreachable too",
-    "candidate_limit": "more region candidates than max_candidates; raise the limit or narrow the patterns",
+    "candidate_limit": "more total nodes than max_candidates; raise the limit (max 5000) or reduce subscriptions",
     "ambiguous_region": "a node name matches both hk_pattern and sg_pattern; make the patterns disjoint",
     "no_nodes": "the subscription and manual_nodes produced no usable outbound",
     "unsupported_node": "the subscription contains a protocol the service will not publish",
@@ -108,8 +134,11 @@ def initialize(root=ROOT):
 def render(root=ROOT):
     s = copy.deepcopy(load_settings(root / "private-config/settings.json"))
     builtin = json.loads((root / "data/direct.json").read_bytes())
-    for field in builtin:
-        s["shared"]["direct"][field] = sorted(set(builtin[field] + s["shared"]["direct"][field]))
+    direct_rules = ([item['rules'] for item in s['services'].values() if item['type'] == 'direct']
+                    if 'services' in s else [s['shared']['direct']])
+    for rules in direct_rules:
+        for field in builtin:
+            rules[field] = sorted(set(builtin[field] + rules[field]))
     device_settings(s)
     for name in ("runtime", "state"):
         private_dir(root / name)

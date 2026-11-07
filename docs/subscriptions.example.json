@@ -1,0 +1,38 @@
+{
+  "subscriptions": [
+    {
+      "name": "tag",
+      "url": "<TAG_HTTPS_SUBSCRIPTION_URL>",
+      "user_agent": "curl/8.10.1",
+      "fetch_method": "curl",
+      "rename_rules": [
+        {
+          "pattern": "^(?:[🇦-🇿]{2}\\s*)?(.+?)[-\\s]?(家宽|住宅|游戏|蜂窝5G|星链|实验节点)?(?:\\s+\\d+)?[丨|].*$",
+          "replacement": "$1-$2-$index",
+          "capture_defaults": {
+            "2": "普通"
+          }
+        }
+      ],
+      "update_policy": "startup"
+    },
+    {
+      "name": "other",
+      "url": "<OTHER_HTTPS_SUBSCRIPTION_URL>",
+      "user_agent": "",
+      "fetch_method": "curl",
+      "rename_rules": [
+        {
+          "pattern": "^(?:[🇦-🇿]{2}\\s*)?(?=[A-Za-z]+\\s*(香港|新加坡|日本|台湾|美国|英国|韩国))([A-Za-z]+).*",
+          "replacement": "$1-$2-$index"
+        }
+      ],
+      "update_policy": "poll",
+      "interval_seconds": 300
+    }
+  ],
+  "refresh_seconds": 300,
+  "probe_interval_seconds": 900,
+  "max_candidates": 1000,
+  "rename_rules": []
+}

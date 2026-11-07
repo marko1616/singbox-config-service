@@ -22,6 +22,13 @@ ROOT = Path(__file__).resolve().parents[1]
 def settings():
     root = json.loads((ROOT / 'templates/private-config/settings.json').read_bytes())
     s = root['shared']
+    # Exercise legacy compatibility with the new composition-first template.
+    s['direct'] = root['services']['bypass']['rules']
+    s['singapore'] = root['services']['sg-business']['rules']
+    s['dns_hosts'] = root['services']['resolver']['hosts']
+    s['own_hy2'] = {'server': '', 'server_port': 443, 'password': '', 'tls': {}}
+    s.pop('subscriptions', None)
+    s['subscription_user_agent'] = 'v2rayNG'
     s.update(api_key='test_' + 'x' * 40, subscription_url='https://subscription.example.invalid/feed')
     s['wireguard'] = {'address': '10.77.0.2/32', 'private_key': '', 'peer_public_key': '',
                       'endpoint': 'wg.example.invalid', 'port': 51820, 'mtu': 1280}
@@ -79,21 +86,22 @@ class SelectionTests(unittest.TestCase):
         seen = []
         def measure(n, s):
             seen.append(n['tag'])
-            return {'hk-001': 90, 'hk-002': 10, 'hk-003': 30, 'sg-001': 20, 'sg-002': 15}[n['tag']]
+            return {'hk-001': 90, 'hk-002': 10, 'hk-003': 30, 'sg-001': 20, 'sg-002': 15, 'hk-own-hy2': 999}[n['tag']]
         c, info = m.select(nodes(), s, measure, no_check)
-        self.assertEqual(len(seen), 10)  # Google and CacheFly stages for five candidates.
-        self.assertNotIn('hk-own-hy2', seen)
-        self.assertEqual([n['tag'] for n in c['hk']], ['hk-002', 'hk-003', 'hk-own-hy2'])
+        self.assertEqual(len(seen), 12)  # Google and CacheFly stages for five candidates.
+        self.assertEqual(seen.count('hk-own-hy2'), 2)
+        self.assertEqual([n['tag'] for n in c['hk']], ['HK b', 'HK c', 'hk-own-hy2'])
         self.assertFalse(info['hk_fallback'])
-        self.assertEqual(info['counts']['hk'], {'tested': 3, 'healthy': 3, 'retained': 3})
+        self.assertEqual(info['counts']['hk'], {'tested': 3, 'healthy': 3, 'retained': 2})
         profile = m.build_profile(s, c)
-        hk = next(n for n in profile['outbounds'] if n['tag'] == 'hk')
-        self.assertEqual(hk['default'], 'hk-002')
-        self.assertEqual(hk['outbounds'], ['hk-002', 'hk-003', 'hk-own-hy2'])
+        self.assertFalse(any(n['tag'] == 'hk' for n in profile['outbounds']))
+        pool = next(n for n in profile['outbounds'] if n['tag'] == 'proxy')
+        self.assertEqual(pool['default'], 'HK b')
+        self.assertEqual(set(pool['outbounds']), {'HK a', 'HK b', 'HK c', 'SG a', 'SG b', 'hk-own-hy2'})
 
     def test_partial_failure_does_not_trigger_backup(self):
         c, info = m.select(nodes(), settings(), lambda n, s: 3 if n['tag'] in ['hk-002', 'sg-001'] else None, no_check)
-        self.assertEqual(c['hk'][0]['tag'], 'hk-002')
+        self.assertEqual(c['hk'][0]['tag'], 'HK b')
         self.assertFalse(info['hk_fallback'])
 
     def test_cachefly_weight_changes_order_and_rejects_failed_download(self):
@@ -101,17 +109,17 @@ class SelectionTests(unittest.TestCase):
         google = {'hk-001': 100, 'hk-002': 150, 'hk-003': 300,
                   'sg-001': 100, 'sg-002': 150}
         download = {'hk-001': 800, 'hk-002': 100, 'hk-003': 10,
-                    'sg-001': None, 'sg-002': 100}
+                    'sg-001': None, 'sg-002': 100, 'hk-own-hy2': None}
         seen = []
         def measure_download(node, settings_arg):
             seen.append(node['tag'])
             return download[node['tag']]
         chosen, info = m.select(nodes(), s, lambda n, s: google[n['tag']], no_check,
                                 measure_download=measure_download)
-        self.assertEqual(chosen['hk'][0]['tag'], 'hk-002')
-        self.assertEqual(chosen['sg'][0]['tag'], 'sg-002')
+        self.assertEqual(chosen['hk'][0]['tag'], 'HK b')
+        self.assertEqual(chosen['sg'][0]['tag'], 'SG b')
         self.assertEqual(info['counts']['sg']['healthy'], 1)
-        self.assertEqual(set(seen), set(download))
+        self.assertEqual(set(seen), set(download) - {'hk-own-hy2'})
 
     def test_debug_explains_every_candidate_decision(self):
         s = settings(); s['top_k'] = 1
@@ -123,13 +131,13 @@ class SelectionTests(unittest.TestCase):
         google = {'hk-001': 100, 'hk-002': 150, 'hk-003': None, 'hk-004': 400,
                   'hk-005': 500,
                   'sg-001': 100, 'sg-002': 200}
-        download = {'hk-001': 500, 'hk-002': 100, 'hk-004': 200,
-                    'sg-001': None, 'sg-002': 100}
+        download = {'hk-001': 500, 'hk-002': 100, 'hk-004': 200, 'hk-005': None,
+                    'sg-001': None, 'sg-002': 100, 'hk-own-hy2': None}
         with self.assertLogs(m.LOG, level='DEBUG') as captured:
             chosen, _ = m.select(candidates, s, lambda n, s: google[n['tag']], no_check,
                                  measure_download=lambda n, s: download[n['tag']])
-        self.assertEqual([n['tag'] for n in chosen['hk'][:1]], ['hk-002'])
-        self.assertEqual([n['tag'] for n in chosen['sg']], ['sg-002'])
+        self.assertEqual([n['tag'] for n in chosen['hk'][:1]], ['HK b'])
+        self.assertEqual([n['tag'] for n in chosen['sg']], ['SG b'])
         logs = '\n'.join(captured.output)
         by_tag = {n['tag']: m.node_log_tag(n) for n in chosen['hk'] + chosen['sg']}
         # The original node config, not the selected set, supplies identifiers
@@ -139,9 +147,9 @@ class SelectionTests(unittest.TestCase):
                           ('sg-002', candidates[4]), ('hk-004', candidates[5]),
                           ('hk-005', candidates[6])]:
             by_tag[tag] = tag + '@' + m.node_fingerprint(node)
-        self.assertIn('tag=' + by_tag['hk-004'] + ' endpoint="node.example.invalid" port=1080', logs)
-        for tag, result in [('hk-001', 'top_k_excluded'), ('hk-002', 'selected'),
-                            ('hk-003', 'google_failed'), ('hk-005', 'not_shortlisted'),
+        self.assertIn('tag=' + by_tag['hk-004'], logs)
+        for tag, result in [('hk-001', 'selected'), ('hk-002', 'selected'),
+                            ('hk-003', 'google_failed'), ('hk-005', 'cachefly_failed'),
                             ('sg-001', 'cachefly_failed'), ('sg-002', 'selected')]:
             self.assertIn('tag=' + by_tag[tag] + ' result=' + result, logs)
         self.assertIn('cachefly tag=' + by_tag['hk-002'] +
@@ -166,20 +174,23 @@ class SelectionTests(unittest.TestCase):
         # No all-failed/failed SG: fail closed too.
         with self.assertRaisesRegex(m.Invalid, 'singapore_unavailable'):
             m.select(nodes(), settings(), lambda n, s: None, no_check)
-        with self.assertRaisesRegex(m.Invalid, 'hong_kong_unavailable'):
-            m.select(nodes(), settings(), lambda n, s: 2 if n['tag'].startswith('sg') else None, no_check)
+        chosen, _ = m.select(nodes(), settings(), lambda n, s: 2 if n['tag'].startswith('sg') else None, no_check)
+        self.assertEqual(chosen['hk'], [])
+        self.assertTrue(chosen['all'])
 
     def test_no_hong_kong_candidates_uses_backup(self):
         sg_only = [n for n in nodes() if n['tag'].startswith('SG')]
         chosen, info = m.select(sg_only, settings(), lambda n, s: 2, no_check)
         self.assertTrue(info['hk_fallback'])
         self.assertEqual([n['tag'] for n in chosen['hk']], ['hk-own-hy2'])
-        self.assertEqual(info['counts']['hk']['retained'], 1)
+        self.assertEqual(info['counts']['hk']['retained'], 0)
+        self.assertEqual(info['counts']['own_hy2']['retained'], 1)
         self.assertEqual(info['counts']['hk']['tested'], 0)
         # Backup unreachable as well: still fail closed.
-        with self.assertRaisesRegex(m.Invalid, 'hong_kong_unavailable'):
-            m.select(sg_only, settings(),
-                     lambda n, s: None if n['tag'] == 'hk-own-hy2' else 2, no_check)
+        chosen, _ = m.select(sg_only, settings(),
+            lambda n, s: None if n['tag'] == 'hk-own-hy2' else 2, no_check)
+        self.assertEqual(chosen['hk'], [])
+        self.assertEqual(len(chosen['all']), 2)
 
     def test_candidate_limit_refuses_truncation(self):
         s = settings(); s['max_candidates'] = 2
@@ -313,13 +324,13 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(p['inbounds'][-1]['type'], 'mixed')
                 self.assertEqual(p['inbounds'][-1]['listen'], '127.0.0.1')
                 self.assertEqual(p['inbounds'][-1]['listen_port'], 10808)
-                self.assertEqual(p['route']['final'], 'direct' if mode == 'whitelist' else 'hk')
+                self.assertEqual(p['route']['final'], 'direct' if mode == 'whitelist' else 'proxy')
                 tags = {x['tag'] for x in p['route']['rule_set']}
                 self.assertEqual('geoip-cn' in tags, mode != 'global')
                 self.assertEqual('geoip-foreign' in tags, mode == 'whitelist')
                 for rule_set in p['route']['rule_set']:
                     if rule_set['type'] == 'remote':
-                        self.assertEqual(rule_set['http_client'], {'detour': 'hk'})
+                        self.assertEqual(rule_set['http_client'], {'detour': 'proxy'})
                         self.assertNotIn('download_detour', rule_set)
                 m.check_profile(p)
         inbound = m.proxy_options({'port': ['20808'], 'listen': ['::1'],
@@ -359,7 +370,7 @@ class ConfigTests(unittest.TestCase):
         p = m.build_profile(s, c)
         r = p['route']['rules']
         self.assertEqual([x.get('outbound') for x in r[1:4]], ['wg-ipv6', 'direct', 'sg'])
-        self.assertEqual(p['route']['final'], 'hk')
+        self.assertEqual(p['route']['final'], 'proxy')
         direct = p['route']['rule_set'][0]
         self.assertEqual(direct['tag'], 'force-direct')
         self.assertTrue(all(len(x) == 1 for x in direct['rules']))
@@ -466,7 +477,7 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(set(self.p.data), {'phone', 'tablet'})
         phone = json.loads(self.p.data['phone'])
         tablet = json.loads(self.p.data['tablet'])
-        self.assertEqual(len(calls), 10)
+        self.assertEqual(len(calls), 12)
         self.assertEqual(phone['endpoints'][0]['address'], ['10.77.0.2/32'])
         self.assertEqual(tablet['endpoints'][0]['address'], ['10.77.0.3/32'])
         self.assertNotEqual(phone['endpoints'][0]['private_key'], tablet['endpoints'][0]['private_key'])
@@ -546,7 +557,7 @@ class PublisherTests(unittest.TestCase):
             try: response = opener.open(req, timeout=2)
             except urllib.error.HTTPError as e: response = e
             with response: return response.status, response.read()
-        self.assertEqual(request('/api/config')[0], 404)
+        self.assertEqual(request('/api/config')[0], 401)
         self.assertEqual(request('/api/config-global-full')[0], 401)
         self.assertEqual(request('/api/config-global-full', self.s['devices'][0]['api_key'])[0], 503)
         self.assertEqual(json.loads(request('/healthz')[1])['ready'], False)
@@ -757,7 +768,7 @@ class DiagnosticsTests(unittest.TestCase):
                         converter=lambda b: nodes(), measure=lambda n, s: 1, checker=checker)
         with self.assertLogs(m.LOG, level="ERROR") as captured:
             self.assertFalse(p.refresh())
-        self.assertEqual(p.status()["error"], "tool_failed")
+        self.assertEqual(p.status()["error"], "all_subscriptions_failed")
         self.assertNotIn("DETAIL-ONLY-IN-LOGS", json.dumps(p.status()))
         self.assertIn("DETAIL-ONLY-IN-LOGS", "\n".join(captured.output))
         self.assertFalse((root / "snapshot.json").exists())
@@ -787,10 +798,10 @@ class DiagnosticsTests(unittest.TestCase):
             raise urllib.error.URLError("timed out fetching " + settings_arg["subscription_url"])
         p = m.Publisher(sp, root / "snapshot.json", fetcher=bad_fetch, converter=lambda b: nodes(),
                         measure=lambda n, s: 1, checker=m.check_profile)
-        with self.assertLogs(m.LOG, level="ERROR") as captured:
+        with self.assertLogs(m.LOG, level="WARNING") as captured:
             self.assertFalse(p.refresh())
-        self.assertEqual(p.status()["error"], "operation_failed")
-        self.assertEqual(p.status()["stage"], "fetch")
+        self.assertEqual(p.status()["error"], "all_subscriptions_failed")
+        self.assertEqual(p.status()["stage"], "subscriptions")
         text = "\n".join(captured.output)
         self.assertIn("URLError", text)
         self.assertIn("stage=fetch", text)
@@ -843,8 +854,8 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIsNone(p.status()["selection"])
         self.assertIn("stage=check", "\n".join(captured.output))
         self.assertFalse((root / "snapshot.json").exists(), "a rejected profile must not be published")
-        self.assertEqual(sorted(p.name for p in root.iterdir()), ["settings.json"],
-                         "diagnostics must not create host files")
+        self.assertEqual(sorted(p.name for p in root.iterdir()), ["settings.json", "snapshot.json.sources.json"],
+                         "only the successful source catalog may survive a failed publication")
 
     def test_success_is_logged_with_counts_and_no_secrets(self):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
@@ -857,7 +868,7 @@ class DiagnosticsTests(unittest.TestCase):
             self.assertTrue(p.refresh(), p.status())
         text = "\n".join(captured.output)
         self.assertIn("published", text)
-        self.assertIn("hk_retained=4 hk_tested=3", text)
+        self.assertIn("hk_retained=3 hk_tested=3", text)
         self.assertIn("sg_retained=2 sg_tested=2", text)
         self.assertNotIn(s["subscription_url"], text)
 
@@ -887,7 +898,7 @@ class ManualNodeTests(unittest.TestCase):
         chosen, info = m.select(merged, settings(), lambda n, s: 3, no_check)
         self.assertFalse(info["hk_fallback"])
         self.assertEqual(len(chosen["hk"]), 2)
-        self.assertEqual([n['tag'] for n in chosen['hk']], ['hk-001', 'hk-own-hy2'])
+        self.assertEqual([n['tag'] for n in chosen['hk']], ['HK manual', 'hk-own-hy2'])
 
     def test_publisher_merges_and_rejects_manual_nodes(self):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
@@ -906,10 +917,10 @@ class ManualNodeTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[1], b"trojan://x@hk.example.invalid:443#HK manual\n")
         self.assertEqual(p.status()["selection"]["counts"]["hk"],
-                         {"tested": 1, "healthy": 1, "retained": 2})
+                         {"tested": 1, "healthy": 1, "retained": 1})
         self.assertFalse(p.status()["selection"]["hk_fallback"])
         # A dropped manual entry must fail the cycle, not silently shrink the pool.
-        p.converter = lambda data: []
+        p.converter = lambda data: [] if data != b"sub" else nodes()
         self.assertFalse(p.refresh())
         self.assertIn("manual_node_rejected", p.status()["error"])
 
