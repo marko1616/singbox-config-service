@@ -21,7 +21,8 @@
         "url": "<HTTPS_SUBSCRIPTION_URL>",
         "user_agent": "",
         "fetch_method": "curl",
-        "update_policy": "poll"
+        "update_policy": "poll",
+        "rename_rules": []
       }
     ],
     "top_k": 3,
@@ -33,8 +34,7 @@
     "sg_pattern": "(?i)(新加坡|Singapore|\\bSG\\b|🇸🇬)",
     "manual_nodes": [],
     "own_hy2": null,
-    "probe_interval_seconds": 900,
-    "rename_rules": []
+    "probe_interval_seconds": 900
   },
   "services": {
     "normal": {

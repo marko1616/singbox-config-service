@@ -35,6 +35,39 @@ def documented_rules():
 
 
 class CatalogTests(unittest.TestCase):
+    def test_source_rules_do_not_inherit_shared_but_legacy_does(self):
+        s = multi_settings()
+        s['rename_rules'] = [{'pattern': '(.*)', 'replacement': 'SHARED-$1'}]
+        s['subscriptions'][1]['rename_rules'] = []
+        self.assertEqual([v['rename_rules'] for v in m.subscription_sources(s)], [[], []])
+        converted, metadata, _ = m.collect_subscriptions(s, lambda _: b'feed', lambda _: nodes())
+        chosen, _ = m.select(converted, s, lambda *_: 1, no_check, metadata=metadata)
+        self.assertIn('HK a', [n['tag'] for n in chosen['all']])
+        legacy = settings(); legacy['rename_rules'] = s['rename_rules']
+        self.assertEqual(m.subscription_sources(legacy)[0]['rename_rules'], s['rename_rules'])
+
+    def test_source_counters_are_independent_and_collisions_remain_unique(self):
+        s = multi_settings()
+        for src in s['subscriptions']:
+            src['rename_rules'] = [{'pattern': '(HK|SG).*', 'replacement': '$1-$index'}]
+        def convert(data):
+            offset = 100 if data == b'first' else 200
+            return [dict(n, server_port=offset + i) for i, n in enumerate(nodes())]
+        def names():
+            converted, metadata, _ = m.collect_subscriptions(
+                s, lambda src: src['name'].encode(), convert)
+            chosen, _ = m.select(converted, s, lambda *_: 1, no_check, metadata=metadata)
+            return {n['server_port']: n['tag'] for n in chosen['all'] if n['type'] == 'socks'}
+        both = names()
+        self.assertEqual(both[100], 'HK-001')
+        self.assertEqual(both[200], 'HK-001 [2]')
+        self.assertEqual(both[202], 'HK-003 [2]')
+        self.assertEqual(len(set(both.values())), len(both))
+        s['subscriptions'].pop(0)
+        alone = names()
+        self.assertEqual(alone[200], 'HK-001')
+        self.assertEqual(alone[202], 'HK-003')
+
     def test_curl_treats_braces_and_brackets_as_one_literal_url(self):
         source = m.subscription_sources(multi_settings())[0]
         source['subscription_url'] += '?filter[region]={hk,sg}'
@@ -125,7 +158,8 @@ class CatalogTests(unittest.TestCase):
                 s = multi_settings()
                 for src, path in zip(s['subscriptions'], ('/first', '/second')):
                     src['url'] = f'https://127.0.0.1:{server.server_port}{path}'
-                s['rename_rules'] = [{'pattern': r'(香港|新加坡)(家宽).*', 'replacement': '$1-$2-$index'}]
+                for src in s['subscriptions']:
+                    src['rename_rules'] = [{'pattern': r'(香港|新加坡)(家宽).*', 'replacement': '$1-$2-$index'}]
                 path = root / 'settings.json'; m.atomic_write(path, m.encode(root_settings(s)))
                 publisher = m.Publisher(path, root / 'snapshot.json', measure=lambda *_: 1)
                 with patch.dict(os.environ, {'CURL_CA_BUNDLE': str(cert), 'NO_PROXY': '127.0.0.1', 'no_proxy': '127.0.0.1'}), \

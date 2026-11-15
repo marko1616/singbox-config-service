@@ -125,8 +125,7 @@ A shared subscription_user_agent can supply a fallback, but an explicit empty pe
   ],
   "refresh_seconds": 300,
   "probe_interval_seconds": 900,
-  "max_candidates": 1000,
-  "rename_rules": []
+  "max_candidates": 1000
 }
 ```
 
@@ -156,9 +155,10 @@ Use per-source rules for different naming schemes rather than applying TAG patte
 TAG examples become `香港-家宽-001` and `香港-普通-001`; optional `capture_defaults: {"2": "普通"}` fills an unmatched/empty second capture in BOTH the name and status type. Defaults are literal strings, never recursively expanded.
 The other source handles the visible `🇸🇬AWS新加坡04...` / `🇯🇵AWS日本09...` prefixes without assuming the truncated suffix, producing `新加坡-AWS-001` / `日本-AWS-001`.
 A lookahead captures region as group 1 before group 2 captures the leading English type label. Extend the country alternatives for other inputs; unmatched formats are preserved.
-Per-source rename_rules override shared rules; an empty list disables rewriting. Nonmatching names remain unchanged.
-Counters follow input order across sources, including subsequently failing nodes, so health changes alone do not renumber
-nodes; changed source order or node deletion can renumber. Collisions receive `[2]` etc.
+Each subscription uses only its own rename_rules; omission or an empty list disables rewriting. Nonmatching names remain unchanged.
+shared.rename_rules remains supported only for manual_nodes and legacy subscription_url, never as a subscriptions fallback. Copy any old shared rules into each subscription that should keep using them.
+Counters are independent per subscription and follow its input order, including subsequently failing nodes, so health changes alone do not renumber
+nodes. Deleting or reordering nodes within that source can renumber; another source cannot advance its counter. Collisions receive `[2]` etc.
 
 Capture **$2** is the display-type label in the tag and health summary, never the protocol's real `type` field.
 Native client protocol columns still show SS/AnyTLS/etc. Region classification always uses original names before renaming.

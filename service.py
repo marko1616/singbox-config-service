@@ -421,7 +421,8 @@ def subscription_sources(s):
     """Normalize new named sources; a legacy single URL remains supported."""
     if 'subscriptions' not in s:
         sources = [{'url': s.get('subscription_url'),
-                    'user_agent': s.get('subscription_user_agent'), 'fetch_method': 'urllib'}]
+                    'user_agent': s.get('subscription_user_agent'), 'fetch_method': 'urllib',
+                    'rename_rules': s.get('rename_rules', [])}]
     else:
         require('subscription_url' not in s, 'subscription_source_conflict')
         sources = s['subscriptions']
@@ -453,7 +454,7 @@ def subscription_sources(s):
         require(policy != 'startup' or 'interval_seconds' not in entry, 'startup_interval_conflict')
         name = entry.get('name', f'source-{index}')
         require(isinstance(name, str) and bool(re.fullmatch(r'[A-Za-z0-9_-]{1,64}', name)), 'subscription_source_name')
-        rules = entry.get('rename_rules', s.get('rename_rules', []))
+        rules = entry.get('rename_rules', [])
         validate_rename_rules(rules)
         result.append({'subscription_url': url, 'subscription_user_agent': agent,
                        'subscription_fetch_method': method, 'name': name, 'rename_rules': rules,
@@ -527,7 +528,8 @@ def collect_subscriptions(s, fetcher, converter, loader=None):
             tags.add(tag)
             node['tag'] = tag
             nodes.append(node)
-            metadata[tag] = {'original': original, 'rename_rules': source['rename_rules']}
+            metadata[tag] = {'original': original, 'rename_rules': source['rename_rules'],
+                             'source': source['name']}
     if s['manual_nodes']:
         extra = converter(('\n'.join(s['manual_nodes']) + '\n').encode())
         require(len(extra) == len(s['manual_nodes']), 'manual_node_rejected')
@@ -761,7 +763,10 @@ def select(nodes, s, measure=probe, checker=check_profile, measure_download=None
         group = regions[0] if regions else 'other'
         n = copy.deepcopy(node)
         n['tag'] = f'{group}-{len(groups[group]) + 1:03d}'
-        name, kind = rename_node(original, meta.get('rename_rules', s.get('rename_rules', [])), counters)
+        # None is the independent manual/direct-call scope; source names are strings.
+        source_counters = counters.setdefault(meta.get('source'), {})
+        name, kind = rename_node(original, meta.get('rename_rules', s.get('rename_rules', [])),
+                                 source_counters)
         base, suffix = name, 1
         while name in used:
             suffix += 1

@@ -33,6 +33,5 @@
   ],
   "refresh_seconds": 300,
   "probe_interval_seconds": 900,
-  "max_candidates": 1000,
-  "rename_rules": []
+  "max_candidates": 1000
 }
